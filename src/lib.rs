@@ -6,7 +6,6 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
-pub mod kv_events;
 pub mod kv_hash;
 pub mod kv_index;
 pub mod metrics;

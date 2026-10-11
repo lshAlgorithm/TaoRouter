@@ -1,10 +1,9 @@
 //! Synthetic event consumer using the shared index and read contract.
 use std::sync::Arc;
 use vllm_router_rs::{
-    kv_events::{decode_batch, validate_device_dp1_batch},
     kv_hash::BlockKeyGenerator,
     kv_index::{
-        local_hashes,
+        decode_batch, local_hashes, validate_device_batch,
         wire::{ExternalBlockHash, KVEvent, KVEventBatch},
         ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TieredMatchProvider,
     },
@@ -38,7 +37,12 @@ fn local_keys(tokens: &[u32]) -> Vec<Arc<str>> {
 
 fn apply(index: &KvBlockIndexer, owner: &ResidencyOwner, batch: &KVEventBatch) {
     // Runtime ingestion must also fence publication; this consumer is single-threaded.
-    validate_device_dp1_batch(batch, 2).unwrap();
+    validate_device_batch(batch, 2).unwrap();
+    let mut owner = owner.clone();
+    let ResidencyOwner::Worker { dp_rank, .. } = &mut owner else {
+        panic!("worker source required")
+    };
+    *dp_rank = batch.data_parallel_rank.unwrap_or(*dp_rank);
     for event in &batch.events {
         match event {
             KVEvent::BlockStored(event) => {
@@ -54,12 +58,246 @@ fn apply(index: &KvBlockIndexer, owner: &ResidencyOwner, batch: &KVEventBatch) {
             }
             KVEvent::BlockRemoved(event) => index.remove(
                 0,
-                owner,
+                &owner,
                 StorageTier::Device,
                 &event.block_hashes.iter().map(opaque).collect::<Vec<_>>(),
             ),
-            KVEvent::AllBlocksCleared(_) => index.clear(owner, ClearScope::Worker),
+            KVEvent::AllBlocksCleared(_) => index.clear(&owner, ClearScope::Worker),
         }
+    }
+}
+
+fn stored_event() -> rmpv::Value {
+    rmpv::Value::Map(vec![
+        ("type".into(), "BlockStored".into()),
+        (
+            "block_hashes".into(),
+            rmpv::Value::Array(vec![
+                rmpv::Value::Binary(vec![1; 32]),
+                rmpv::Value::Binary(vec![2; 32]),
+            ]),
+        ),
+        ("parent_block_hash".into(), rmpv::Value::Nil),
+        (
+            "token_ids".into(),
+            rmpv::Value::Array(vec![1.into(), 2.into(), 3.into(), 4.into()]),
+        ),
+        ("block_size".into(), 2.into()),
+        ("lora_id".into(), rmpv::Value::Nil),
+        ("lora_name".into(), rmpv::Value::Nil),
+        ("medium".into(), "GPU".into()),
+    ])
+}
+
+fn removed_event() -> rmpv::Value {
+    rmpv::Value::Map(vec![
+        ("type".into(), "BlockRemoved".into()),
+        (
+            "block_hashes".into(),
+            rmpv::Value::Array(vec![rmpv::Value::Binary(vec![2; 32])]),
+        ),
+        ("medium".into(), "GPU".into()),
+    ])
+}
+
+fn cleared_event() -> rmpv::Value {
+    rmpv::Value::Map(vec![("type".into(), "AllBlocksCleared".into())])
+}
+
+fn decoded_event(event: rmpv::Value, rank: Option<rmpv::Value>) -> KVEventBatch {
+    let mut batch = vec![1.0.into(), rmpv::Value::Array(vec![event])];
+    if let Some(rank) = rank {
+        batch.push(rank);
+    }
+    let mut bytes = Vec::new();
+    rmpv::encode::write_value(&mut bytes, &rmpv::Value::Array(batch)).unwrap();
+    decode_batch(&bytes).unwrap()
+}
+
+#[test]
+fn stored_shape_admits_absent_zero_and_nonzero_rank() {
+    for rank in [None, Some(0_u32), Some(7)] {
+        let batch = decoded_event(stored_event(), rank.map(Into::into));
+        assert_eq!(batch.data_parallel_rank, rank);
+        assert!(validate_device_batch(&batch, 2).is_ok(), "rank {rank:?}");
+    }
+}
+
+#[test]
+fn removed_shape_admits_absent_zero_and_nonzero_rank() {
+    for rank in [None, Some(0_u32), Some(7)] {
+        let batch = decoded_event(removed_event(), rank.map(Into::into));
+        assert_eq!(batch.data_parallel_rank, rank);
+        assert!(validate_device_batch(&batch, 2).is_ok(), "rank {rank:?}");
+    }
+}
+
+#[test]
+fn cleared_shape_admits_absent_zero_and_nonzero_rank() {
+    for rank in [None, Some(0_u32), Some(7)] {
+        let batch = decoded_event(cleared_event(), rank.map(Into::into));
+        assert_eq!(batch.data_parallel_rank, rank);
+        assert!(validate_device_batch(&batch, 2).is_ok(), "rank {rank:?}");
+    }
+}
+
+#[test]
+fn same_source_rank_remove_and_clear_are_isolated() {
+    let index = KvBlockIndexer::new();
+    let configured = ResidencyOwner::Worker {
+        source: Arc::from("publisher-A"),
+        dp_rank: 0,
+        incarnation: 9,
+    };
+    let depths = || {
+        let mut hits: Vec<_> = index
+            .find_matches(&MatchQuery {
+                group_idx: 0,
+                local_hashes: local_keys(&[1, 2, 3, 4]),
+                tiers_of_interest: vec![StorageTier::Device],
+            })
+            .into_iter()
+            .map(|hit| {
+                assert_eq!(hit.target.instance_id.as_ref(), "publisher-A");
+                (hit.target.dp_rank, hit.matched_depth)
+            })
+            .collect();
+        hits.sort_unstable();
+        hits
+    };
+    // Both ranks announce the same engine hashes for the same local path;
+    // this regression does not depend on different-hash alias support.
+    for rank in [0_u32, 7] {
+        apply(
+            &index,
+            &configured,
+            &decoded_event(stored_event(), Some(rank.into())),
+        );
+    }
+    assert_eq!(depths(), vec![(0, 2), (7, 2)]);
+    apply(
+        &index,
+        &configured,
+        &decoded_event(removed_event(), Some(0.into())),
+    );
+    assert_eq!(depths(), vec![(0, 1), (7, 2)]);
+    apply(
+        &index,
+        &configured,
+        &decoded_event(stored_event(), Some(0.into())),
+    );
+    apply(
+        &index,
+        &configured,
+        &decoded_event(removed_event(), Some(7.into())),
+    );
+    assert_eq!(depths(), vec![(0, 2), (7, 1)]);
+    apply(
+        &index,
+        &configured,
+        &decoded_event(cleared_event(), Some(7.into())),
+    );
+    assert_eq!(depths(), vec![(0, 2)]);
+    apply(
+        &index,
+        &configured,
+        &decoded_event(stored_event(), Some(7.into())),
+    );
+    apply(
+        &index,
+        &configured,
+        &decoded_event(cleared_event(), Some(0.into())),
+    );
+    assert_eq!(depths(), vec![(7, 2)]);
+}
+
+#[test]
+fn absent_rank_uses_configured_source_and_explicit_zero_overrides_it() {
+    for wire_rank in [None, Some(rmpv::Value::Nil), Some(0.into())] {
+        let index = KvBlockIndexer::new();
+        let configured = ResidencyOwner::Worker {
+            source: Arc::from("publisher-A"),
+            dp_rank: 7,
+            incarnation: 9,
+        };
+        let expected_rank = if wire_rank == Some(0.into()) {
+            Some(0)
+        } else {
+            None
+        };
+        let batch = decoded_event(stored_event(), wire_rank.clone());
+        assert_eq!(batch.data_parallel_rank, expected_rank);
+        apply(&index, &configured, &batch);
+        let query = MatchQuery {
+            group_idx: 0,
+            local_hashes: local_keys(&[1, 2, 3, 4]),
+            tiers_of_interest: vec![StorageTier::Device],
+        };
+        let hits = index.find_matches(&query);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target.dp_rank, expected_rank.unwrap_or(7));
+        assert_eq!(hits[0].matched_depth, 2);
+        apply(
+            &index,
+            &configured,
+            &decoded_event(removed_event(), wire_rank.clone()),
+        );
+        let hits = index.find_matches(&query);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target.dp_rank, expected_rank.unwrap_or(7));
+        assert_eq!(hits[0].matched_depth, 1);
+        apply(
+            &index,
+            &configured,
+            &decoded_event(cleared_event(), wire_rank),
+        );
+        assert!(index.find_matches(&query).is_empty());
+    }
+}
+
+#[test]
+fn extra_keys_decode_losslessly_and_admit_only_supported_shapes() {
+    for (wire, expected, admitted) in [
+        (None, None, true),
+        (Some(rmpv::Value::Nil), None, true),
+        (
+            Some(rmpv::Value::Array(vec![rmpv::Value::Nil; 2])),
+            Some(vec![rmpv::Value::Nil; 2]),
+            true,
+        ),
+        (
+            Some(rmpv::Value::Array(vec![rmpv::Value::Nil])),
+            Some(vec![rmpv::Value::Nil]),
+            false,
+        ),
+        (
+            Some(rmpv::Value::Array(vec![
+                rmpv::Value::Nil,
+                rmpv::Value::Binary(vec![0xc1, 0xff]),
+            ])),
+            Some(vec![
+                rmpv::Value::Nil,
+                rmpv::Value::Binary(vec![0xc1, 0xff]),
+            ]),
+            false,
+        ),
+    ] {
+        let rmpv::Value::Map(mut event) = stored_event() else {
+            unreachable!()
+        };
+        if let Some(wire) = wire {
+            event.push(("extra_keys".into(), wire));
+        }
+        let batch = decoded_event(rmpv::Value::Map(event), None);
+        let KVEvent::BlockStored(stored) = &batch.events[0] else {
+            panic!("Store required")
+        };
+        assert_eq!(stored.extra_keys, expected);
+        assert_eq!(
+            validate_device_batch(&batch, 2).is_ok(),
+            admitted,
+            "{expected:?}"
+        );
     }
 }
 

@@ -7,7 +7,7 @@ pub fn parse_endpoint_mapping(value: &str) -> Result<(String, String), String> {
     let (worker, endpoint) = value
         .split_once('=')
         .ok_or("KV endpoint mapping must be WORKER_HTTP_URL=tcp://HOST:PORT; for example: http://worker:8000=tcp://publisher:5557")?;
-    Ok((canonical_worker(worker)?, canonical_endpoint(endpoint)?))
+    Ok((canonical_worker(worker)?.0, canonical_endpoint(endpoint)?))
 }
 
 pub fn resolve_endpoints(
@@ -20,7 +20,7 @@ pub fn resolve_endpoints(
     }
     let mut overrides = HashMap::new();
     for (worker, endpoint) in mappings {
-        let worker = canonical_worker(worker)?;
+        let (worker, _) = canonical_worker(worker)?;
         if overrides
             .insert(worker.clone(), canonical_endpoint(endpoint)?)
             .is_some()
@@ -32,15 +32,13 @@ pub fn resolve_endpoints(
     let mut endpoints_seen = HashSet::new();
     let mut resolved = Vec::with_capacity(worker_urls.len());
     for worker in worker_urls {
-        let canonical = canonical_worker(worker)?;
+        let (canonical, host) = canonical_worker(worker)?;
         if !workers_seen.insert(canonical.clone()) {
             return Err(format!("duplicate static worker URL: {canonical}"));
         }
         let endpoint = if let Some(endpoint) = overrides.remove(&canonical) {
             endpoint
         } else {
-            let parsed = Url::parse(&canonical).map_err(|error| error.to_string())?;
-            let host = display_host(&parsed)?;
             canonical_endpoint(&format!("tcp://{host}:{fallback_port}"))?
         };
         if !endpoints_seen.insert(endpoint.clone()) {
@@ -51,7 +49,7 @@ pub fn resolve_endpoints(
         // Keep the registry's exact URL as the ownership key.
         resolved.push((worker.clone(), endpoint));
     }
-    if let Some(unknown) = overrides.keys().next() {
+    if let Some(unknown) = overrides.keys().min() {
         return Err(format!(
             "KV endpoint mapping refers to an unconfigured worker: {unknown}"
         ));
@@ -59,7 +57,10 @@ pub fn resolve_endpoints(
     Ok(resolved)
 }
 
-fn canonical_worker(value: &str) -> Result<String, String> {
+// Worker identity is URL-syntax canonical, not inferred physical-host identity:
+// keep mapped IPv6 distinct here, while publisher comparison folds it in
+// canonical_endpoint. Returned ownership keys remain the exact registry strings.
+fn canonical_worker(value: &str) -> Result<(String, String), String> {
     let parsed = Url::parse(value).map_err(|error| format!("invalid worker URL: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host().is_none()
@@ -71,8 +72,11 @@ fn canonical_worker(value: &str) -> Result<String, String> {
     {
         return Err("KV workers must be plain HTTP(S) origins without credentials or paths".into());
     }
-    display_host(&parsed)?;
-    Ok(parsed.to_string().trim_end_matches('/').to_string())
+    if parsed.port() == Some(0) {
+        return Err("KV worker port must be nonzero".into());
+    }
+    let host = display_host(&parsed)?;
+    Ok((parsed.to_string().trim_end_matches('/').to_string(), host))
 }
 
 fn canonical_endpoint(value: &str) -> Result<String, String> {

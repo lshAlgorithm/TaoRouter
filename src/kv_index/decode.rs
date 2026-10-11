@@ -1,13 +1,16 @@
-//! Bounded structural decoding into the shared PR326 wire contract.
+//! Bounded structural decoding into the shared wire contract.
 use std::{collections::HashSet, io::Cursor};
 
-use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
+use crate::kv_index::wire::{KVEvent, KVEventBatch};
 use rmpv::Value;
 use serde::Deserialize;
 
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Decode atomically without conflating structural validity with device admission.
+/// The payload byte cap is checked before parsing; nesting depth is limited
+/// during each parse. The event count is checked after materializing the Value
+/// tree. These limits do not constitute a hard decoded-heap budget.
 pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err("KV event payload exceeds 16 MiB".into());
@@ -24,7 +27,9 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     if cursor.position() as usize != payload.len() {
         return Err("trailing bytes after KV event batch".into());
     }
-    let batch = value.as_array().ok_or("KV event batch must be an array")?;
+    let Value::Array(mut batch) = value else {
+        return Err("KV event batch must be an array".into());
+    };
     if !(2..=3).contains(&batch.len()) {
         return Err("KV batch requires timestamp, events, and optional rank".into());
     }
@@ -39,11 +44,16 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
                 .map_err(|_| "invalid DP rank")?,
         ),
     };
-    let events = batch[1].as_array().ok_or("KV events must be an array")?;
+    let Value::Array(events) = batch.remove(1) else {
+        return Err("KV events must be an array".into());
+    };
     if events.len() > 4096 {
         return Err("KV event batch exceeds the event limit".into());
     }
-    let events = events.iter().map(decode_event).collect::<Result<_, _>>()?;
+    let events = events
+        .into_iter()
+        .map(decode_event)
+        .collect::<Result<_, _>>()?;
     Ok(KVEventBatch {
         ts,
         events,
@@ -51,7 +61,7 @@ pub fn decode_batch(payload: &[u8]) -> Result<KVEventBatch, String> {
     })
 }
 
-fn decode_event(event: &Value) -> Result<KVEvent, String> {
+fn decode_event(event: Value) -> Result<KVEvent, String> {
     let pairs = event.as_map().ok_or("KV event must be a tagged map")?;
     let mut keys = HashSet::new();
     for (key, _) in pairs {
@@ -137,8 +147,8 @@ fn decode_event(event: &Value) -> Result<KVEvent, String> {
     }
     // The Value deserializer turns invalid UTF-8 strings into bytes, including
     // opaque extra-key values and map keys. Reject them before DTO conversion.
-    validate_utf8_strings(event)?;
-    rmpv::ext::from_value(event.clone()).map_err(|error| format!("invalid KV event: {error}"))
+    validate_utf8_strings(&event)?;
+    rmpv::ext::from_value(event).map_err(|error| format!("invalid KV event: {error}"))
 }
 
 fn validate_utf8_strings(value: &Value) -> Result<(), String> {
@@ -171,92 +181,11 @@ fn validate_wire_hash(hash: &Value) -> Result<(), String> {
     }
 }
 
-/// Admit only the narrow normal-dense, independently addressed GPU contract.
-/// This checks event shape, not the publisher's hash algorithm, cache namespace,
-/// remote incarnation or freshness. The source adapter must establish those
-/// facts independently before publishing observations to the shared index.
-pub fn validate_device_dp1_batch(
-    batch: &KVEventBatch,
-    expected_block_size: usize,
-) -> Result<(), String> {
-    if expected_block_size == 0 || batch.data_parallel_rank.is_some_and(|rank| rank != 0) {
-        return Err(
-            "only independent DP=1 publishers with nonzero block size are supported".into(),
-        );
-    }
-    for event in &batch.events {
-        let (hashes, medium, group, locality, ownership) = match event {
-            KVEvent::AllBlocksCleared(_) => continue,
-            KVEvent::BlockRemoved(event) => (
-                &event.block_hashes,
-                &event.medium,
-                event.group_idx,
-                &event.locality,
-                &event.ownership,
-            ),
-            KVEvent::BlockStored(event) => {
-                if event.block_size as usize != expected_block_size
-                    || event.block_hashes.len().checked_mul(expected_block_size)
-                        != Some(event.token_ids.len())
-                    || event.lora_id.is_some()
-                    || event.lora_name.is_some()
-                    || event.extra_keys.as_ref().is_some_and(|keys| {
-                        keys.len() != event.block_hashes.len()
-                            || keys.iter().any(|key| !key.is_nil())
-                    })
-                    || event
-                        .kv_cache_spec_kind
-                        .as_deref()
-                        .is_some_and(|kind| kind != "full_attention")
-                    || event.kv_cache_spec_sliding_window.is_some()
-                    || event.session_id.is_some()
-                {
-                    return Err(
-                        "stored event is outside the normal-dense complete-block contract".into(),
-                    );
-                }
-                if let Some(parent) = &event.parent_block_hash {
-                    validate_hash(parent)?;
-                }
-                (
-                    &event.block_hashes,
-                    &event.medium,
-                    event.group_idx,
-                    &event.locality,
-                    &event.ownership,
-                )
-            }
-        };
-        if medium.as_deref() != Some("GPU")
-            || group.is_some_and(|group| group != 0)
-            || locality
-                .as_deref()
-                .is_some_and(|locality| locality != "LOCAL")
-            || ownership.is_some()
-        {
-            return Err("event is outside the GPU group-0 local ownership contract".into());
-        }
-        if hashes.is_empty() {
-            return Err("KV event hashes cannot be empty".into());
-        }
-        for hash in hashes {
-            validate_hash(hash)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_hash(hash: &ExternalBlockHash) -> Result<(), String> {
-    match hash {
-        ExternalBlockHash::Bytes(bytes) if bytes.len() == 32 => Ok(()),
-        _ => Err("KV hash must be 32-byte sha256_cbor bytes".into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv_index::wire::BlockStored;
+    use crate::kv_index::validate_device_batch;
+    use crate::kv_index::wire::{BlockStored, ExternalBlockHash};
 
     fn stored() -> Value {
         let event = KVEvent::BlockStored(BlockStored {
@@ -341,13 +270,13 @@ mod tests {
         assert_eq!(event.lora_id, Some(9));
         assert_eq!(event.lora_name.as_deref(), Some("adapter"));
         assert_eq!(event.extra_keys, Some(vec!["salt".into()]));
-        assert!(validate_device_dp1_batch(&batch, 2).is_err());
+        assert!(validate_device_batch(&batch, 2).is_err());
     }
 
     #[test]
     fn device_admission_is_separate_and_conservative() {
         let batch = decode_batch(&encode(vec![stored()], Value::Nil)).unwrap();
-        assert!(validate_device_dp1_batch(&batch, 2).is_ok());
+        assert!(validate_device_batch(&batch, 2).is_ok());
         for (key, value) in [
             ("medium", "CPU".into()),
             ("medium", Value::Nil),
@@ -360,7 +289,7 @@ mod tests {
             let mut event = stored();
             change(&mut event, key, value);
             let batch = decode_batch(&encode(vec![event], 0.into())).unwrap();
-            assert!(validate_device_dp1_batch(&batch, 2).is_err(), "{key}");
+            assert!(validate_device_batch(&batch, 2).is_err(), "{key}");
         }
     }
 
@@ -394,7 +323,7 @@ mod tests {
         assert!(
             matches!(&batch.events[0], KVEvent::BlockRemoved(event) if event.medium.as_deref() == Some("CPU"))
         );
-        assert!(validate_device_dp1_batch(&batch, 2).is_err());
+        assert!(validate_device_batch(&batch, 2).is_err());
     }
 
     #[test]
@@ -408,7 +337,7 @@ mod tests {
         change(&mut event, "parent_block_hash", Value::Nil);
         let mut payload = encode(vec![event], 0.into());
         let batch = decode_batch(&payload).unwrap();
-        assert!(validate_device_dp1_batch(&batch, 2).is_ok());
+        assert!(validate_device_batch(&batch, 2).is_ok());
 
         let key = b"parent_block_hash";
         let parent = payload
@@ -453,7 +382,7 @@ mod tests {
                 panic!("stored expected")
             };
             assert_eq!(event.extra_keys.as_ref(), Some(&extras));
-            assert!(validate_device_dp1_batch(&batch, 2).is_err());
+            assert!(validate_device_batch(&batch, 2).is_err());
 
             let opaque = payload
                 .windows(34)

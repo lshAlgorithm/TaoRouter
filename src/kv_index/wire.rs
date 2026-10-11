@@ -69,6 +69,8 @@ pub enum KVEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockStored {
+    /// Opaque, lossless MessagePack values. Structural acceptance does not
+    /// establish extension semantics or device eligibility for consumers.
     #[serde(default)]
     pub extra_keys: Option<Vec<rmpv::Value>>,
     pub block_hashes: Vec<ExternalBlockHash>,
