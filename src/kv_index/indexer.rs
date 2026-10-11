@@ -346,7 +346,8 @@ impl GroupShard {
                 node_claims.push(claims[advanced].clone());
                 advanced += 1;
             }
-            if advanced == 0 {
+            // Retain the matched prefix, but never skip an unmatched edge suffix.
+            if advanced == 0 || advanced < edge.len() {
                 break;
             }
             qi += advanced;
