@@ -394,9 +394,34 @@ fn worker_parent_alias_can_extend_cache_owner_path() {
 }
 
 #[test]
+fn no_parent_starts_at_root() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("a", 3);
+    index.store(
+        0,
+        owner.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:100", "x"), ("i:101", "y")]),
+    );
+    assert_eq!(
+        depth(&index, 0, &owner, StorageTier::Device, &["x", "y"]),
+        2
+    );
+    assert_eq!(depth(&index, 0, &owner, StorageTier::Device, &["y"]), 0);
+}
+
+#[test]
 fn unknown_initial_parent_keeps_root_fallback() {
     let index = KvBlockIndexer::new();
     let owner = worker("a", 3);
+    index.store(
+        0,
+        owner.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:99", "prefix")]),
+    );
     index.store(
         0,
         owner.clone(),
@@ -405,4 +430,9 @@ fn unknown_initial_parent_keeps_root_fallback() {
         &blocks(&[("i:100", "x")]),
     );
     assert_eq!(depth(&index, 0, &owner, StorageTier::Device, &["x"]), 1);
+    // Root attachment does not recover the missing ancestry of this suffix.
+    assert_eq!(
+        depth(&index, 0, &owner, StorageTier::Device, &["prefix", "x"]),
+        1
+    );
 }

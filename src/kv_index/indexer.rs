@@ -32,11 +32,26 @@ pub struct TierMatch {
 
 type OwnerTier = (ResidencyOwner, StorageTier);
 type NodeRef = Arc<RwLock<TreeNode>>;
-type EdgeBlock = (Arc<str>, Arc<str>); // (seq_hash, local_hash)
+type IncomingBlock = (Arc<str>, Arc<str>); // (seq_hash, local_hash)
+type EdgeBlock = (HashSet<Arc<str>>, Arc<str>); // (historical seq hashes, local_hash)
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_ANCHOR_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_anchor_clone() {
+    let hook = AFTER_ANCHOR_CLONE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// Length of the common prefix between an edge and the incoming blocks,
 /// compared by local hash only.
-fn edge_common_prefix(edge: &[EdgeBlock], incoming: &[EdgeBlock]) -> usize {
+fn edge_common_prefix(edge: &[EdgeBlock], incoming: &[IncomingBlock]) -> usize {
     edge.iter()
         .zip(incoming.iter())
         .take_while(|(e, b)| e.1 == b.1)
@@ -49,11 +64,10 @@ fn edge_common_prefix(edge: &[EdgeBlock], incoming: &[EdgeBlock]) -> usize {
 /// block carries its own claim set — residency is per block, so a `remove` of
 /// one block never disturbs the claims on its siblings.
 struct TreeNode {
-    /// Edge blocks leading into this node; empty on the root sentinel.
-    edge: Vec<EdgeBlock>,
-    /// Historical engine identities for each logical block, parallel to `edge`.
+    /// Edge blocks with historical identities; empty on the root sentinel.
     /// Topology and parent anchors survive removal of residency claims.
-    aliases: Vec<HashSet<Arc<str>>>,
+    /// Historical aliases are retained without a memory bound.
+    edge: Vec<EdgeBlock>,
     /// Per-block residency claims, parallel to `edge`; `claims[i]` owns
     /// `edge[i]`. Empty on the root sentinel.
     claims: Vec<Vec<OwnerTier>>,
@@ -65,17 +79,17 @@ impl TreeNode {
     fn root() -> Self {
         TreeNode {
             edge: Vec::new(),
-            aliases: Vec::new(),
             claims: Vec::new(),
             children: HashMap::new(),
         }
     }
-    fn with_edge(edge: Vec<EdgeBlock>) -> Self {
-        let claims = (0..edge.len()).map(|_| Vec::new()).collect();
-        let aliases = (0..edge.len()).map(|_| HashSet::new()).collect();
+    fn with_edge(blocks: &[IncomingBlock]) -> Self {
+        let claims = (0..blocks.len()).map(|_| Vec::new()).collect();
         TreeNode {
-            edge,
-            aliases,
+            edge: blocks
+                .iter()
+                .map(|(seq, local)| (HashSet::from([seq.clone()]), local.clone()))
+                .collect(),
             claims,
             children: HashMap::new(),
         }
@@ -93,7 +107,8 @@ struct GroupShard {
     /// Engine seq hash → tree node, so a store jumps to its parent and a
     /// `BlockRemoved` (carrying only seq hashes) finds the node to drop.
     // ponytail: never trimmed — topology outlives residency; unique-prefix churn
-    // grows it without limit. Revisit with an epoch leaf sweep if growth shows.
+    // grows topology and historical alias sets without limit. Revisit with an
+    // epoch leaf sweep if growth shows.
     anchors: DashMap<Arc<str>, NodeRef>,
     /// Reverse lookup: (owner, tier) → seq hashes claimed.
     reverse: DashMap<OwnerTier, HashSet<Arc<str>>>,
@@ -126,26 +141,37 @@ impl GroupShard {
         owner: ResidencyOwner,
         tier: StorageTier,
         parent_seq: Option<Arc<str>>,
-        blocks: &[EdgeBlock],
+        blocks: &[IncomingBlock],
     ) {
         let key = (owner, tier);
-        // Only the first unknown parent falls back to the root. Later cursors
-        // were recorded by this store and must follow their current anchor.
-        let mut cursor = parent_seq.filter(|seq| self.anchors.contains_key(seq));
+        // Preserve the inherited unknown-parent root fallback, not ancestry
+        // recovery: block-local hashes cannot prove a full request prefix.
+        // Missing-ancestry recovery/trust gating belongs to the source lifecycle.
+        // Later cursors were recorded here and must follow their current anchor.
+        let mut cursor = parent_seq.filter(|seq| {
+            let known = self.anchors.contains_key(seq);
+            if !known && !seq.is_empty() {
+                tracing::debug!(parent_seq = %seq, "kv_index: unknown parent; using root fallback");
+            }
+            known
+        });
         let mut bi = 0;
         while bi < blocks.len() {
             let node = cursor
                 .as_ref()
                 .and_then(|seq| self.anchors.get(seq).map(|n| n.clone()))
                 .unwrap_or_else(|| self.root.clone());
+            #[cfg(test)]
+            after_anchor_clone();
             let mut parent = node.write();
             if let Some(seq) = &cursor {
                 let Some(pos) = parent
-                    .aliases
+                    .edge
                     .iter()
-                    .position(|aliases| aliases.contains(seq))
+                    .position(|(aliases, _)| aliases.contains(seq))
                 else {
-                    // A split moved the cursor after its anchor was cloned.
+                    // The same split-only progress argument as remove_claim
+                    // applies to this fixed cursor; resolve its moved anchor.
                     continue;
                 };
                 if pos + 1 < parent.edge.len() {
@@ -156,7 +182,7 @@ impl GroupShard {
             let Some(child) = child else {
                 // Keep the parent locked from lookup through publication so
                 // another writer cannot replace a newly installed child.
-                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(blocks[bi..].to_vec())));
+                let new_node = Arc::new(RwLock::new(TreeNode::with_edge(&blocks[bi..])));
                 let mut new = new_node.write();
                 self.record_locked(&mut new, &new_node, &key, &blocks[bi..]);
                 parent
@@ -184,10 +210,10 @@ impl GroupShard {
         n: &mut TreeNode,
         node: &NodeRef,
         key: &OwnerTier,
-        incoming: &[EdgeBlock],
+        incoming: &[IncomingBlock],
     ) {
         for (i, (seq, _)) in incoming.iter().enumerate() {
-            n.aliases[i].insert(seq.clone());
+            n.edge[i].0.insert(seq.clone());
             self.anchors.insert(seq.clone(), node.clone());
             if self
                 .reverse
@@ -210,17 +236,15 @@ impl GroupShard {
     /// Called under the caller's write lock on `child`.
     fn split_locked(&self, c: &mut TreeNode, pos: usize) {
         let remainder: Vec<EdgeBlock> = c.edge.split_off(pos);
-        let rem_aliases = c.aliases.split_off(pos);
         let rem_claims: Vec<Vec<OwnerTier>> = c.claims.split_off(pos);
         let old_children = std::mem::take(&mut c.children);
         let rem_first = remainder[0].1.clone();
         let rem_node = Arc::new(RwLock::new(TreeNode {
             edge: remainder,
-            aliases: rem_aliases,
             claims: rem_claims,
             children: old_children,
         }));
-        for aliases in &rem_node.read().aliases {
+        for (aliases, _) in &rem_node.read().edge {
             for seq in aliases {
                 self.anchors.insert(seq.clone(), rem_node.clone());
             }
@@ -298,20 +322,29 @@ impl GroupShard {
 
     /// Drop the logical block claim only after its last active alias is gone.
     fn remove_claim(&self, seq: &Arc<str>, key: &OwnerTier) {
+        // Contract: within a shard an engine key always identifies the same
+        // full logical path. Topology only splits, never merges or prepends.
+        // Moving a fixed alias at position p cuts a nonempty prefix k, leaving
+        // p-k; thus only finitely many split-induced re-resolutions are possible.
+        // This does not bound elapsed time or lock starvation. Do not cap retries:
+        // reverse already lost this identity, so abandoned cleanup leaves a claim
+        // that Clear cannot enumerate.
         loop {
             // Never hold an anchors map guard while taking the node lock.
             let Some(node) = self.anchors.get(seq).map(|n| n.clone()) else {
                 return;
             };
+            #[cfg(test)]
+            after_anchor_clone();
             let mut n = node.write();
-            let Some(idx) = n.aliases.iter().position(|aliases| aliases.contains(seq)) else {
+            let Some(idx) = n.edge.iter().position(|(aliases, _)| aliases.contains(seq)) else {
                 // A concurrent split moved this alias; resolve it again.
                 continue;
             };
             let active = self
                 .reverse
                 .get(key)
-                .is_some_and(|seqs| n.aliases[idx].iter().any(|alias| seqs.contains(alias)));
+                .is_some_and(|seqs| n.edge[idx].0.iter().any(|alias| seqs.contains(alias)));
             if !active {
                 n.claims[idx].retain(|claim| claim != key);
             }
@@ -337,21 +370,20 @@ impl GroupShard {
                 Some(c) => c,
                 None => break,
             };
-            // Snapshot read; a concurrent split may shrink this edge after. Safe —
-            // claims move with their block, so a stale snapshot is at worst suboptimal.
-            let (edge, claims) = {
+            // Match under the read guard and copy only matching claims, never
+            // the potentially unbounded historical identity sets.
+            let advanced = {
                 let c = child.read();
-                (c.edge.clone(), c.claims.clone())
+                let mut advanced = 0;
+                while advanced < c.edge.len()
+                    && qi + advanced < query.local_hashes.len()
+                    && c.edge[advanced].1 == query.local_hashes[qi + advanced]
+                {
+                    node_claims.push(c.claims[advanced].clone());
+                    advanced += 1;
+                }
+                advanced
             };
-            // Advance through as many edge elements as the query matches.
-            let mut advanced = 0;
-            while advanced < edge.len()
-                && qi + advanced < query.local_hashes.len()
-                && edge[advanced].1 == query.local_hashes[qi + advanced]
-            {
-                node_claims.push(claims[advanced].clone());
-                advanced += 1;
-            }
             if advanced == 0 {
                 break;
             }
@@ -537,9 +569,9 @@ mod tests {
                 .clone();
             let node = node.read();
             let pos = node
-                .aliases
+                .edge
                 .iter()
-                .position(|aliases| aliases.contains(seq))
+                .position(|(aliases, _)| aliases.contains(seq))
                 .expect("anchor contains alias");
             assert!(node.claims[pos].contains(key));
         }
@@ -562,7 +594,8 @@ mod tests {
         let shard = idx.shard(0);
         assert_observations(&shard, &key, &["i:900", "i:42"]);
         let node = shard.anchors.get("i:900").unwrap().clone();
-        assert_eq!(node.read().edge[0].0, h("i:900"));
+        assert!(node.read().edge[0].0.contains("i:900"));
+        assert!(node.read().edge[0].0.contains("i:42"));
 
         idx.remove(
             0,
@@ -575,7 +608,7 @@ mod tests {
         idx.remove(0, &owner, StorageTier::Device, &[h("i:900"), h("i:900")]);
         assert_observations(&shard, &key, &[]);
         assert!(node.read().claims[0].is_empty());
-        assert_eq!(node.read().aliases[0].len(), 2);
+        assert_eq!(node.read().edge[0].0.len(), 2);
         assert!(shard.counts.get(&key).is_none());
     }
 
@@ -627,9 +660,9 @@ mod tests {
             let node = shard.anchors.get(seq).unwrap().clone();
             let node = node.read();
             let pos = node
-                .aliases
+                .edge
                 .iter()
-                .position(|aliases| aliases.contains(seq))
+                .position(|(aliases, _)| aliases.contains(seq))
                 .unwrap();
             assert!(!node.claims[pos].contains(&kb));
         }
@@ -641,6 +674,133 @@ mod tests {
             ),
             3
         );
+    }
+
+    #[test]
+    fn remove_retries_stale_anchor_after_split_without_leaving_claim() {
+        let idx = Arc::new(KvBlockIndexer::new());
+        let a = worker("a");
+        let b = worker("b");
+        for (owner, seqs) in [
+            (a.clone(), ["i:100", "i:101", "i:102"]),
+            (b.clone(), ["i:200", "i:201", "i:202"]),
+        ] {
+            idx.store(
+                0,
+                owner,
+                StorageTier::Device,
+                None,
+                &[
+                    (h(seqs[0]), h("x")),
+                    (h(seqs[1]), h("y")),
+                    (h(seqs[2]), h("z")),
+                ],
+            );
+        }
+        let shard = idx.shard(0);
+        let old_anchor = shard.anchors.get("i:202").unwrap().clone();
+        let split_index = idx.clone();
+        AFTER_ANCHOR_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Legal interleaving: another owner splits after remove has
+                // cloned its anchor, but before it takes that node's lock.
+                split_index.store(
+                    0,
+                    worker("a"),
+                    StorageTier::Device,
+                    None,
+                    &[(h("i:100"), h("x"))],
+                );
+                let moved = split_index.shard(0).anchors.get("i:202").unwrap().clone();
+                assert!(!Arc::ptr_eq(&old_anchor, &moved));
+                assert!(!old_anchor
+                    .read()
+                    .edge
+                    .iter()
+                    .any(|(seqs, _)| seqs.contains("i:202")));
+            }));
+        });
+        idx.remove(0, &b, StorageTier::Device, &[h("i:202")]);
+        let ka = (a, StorageTier::Device);
+        let kb = (b, StorageTier::Device);
+        assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
+        assert_observations(&shard, &kb, &["i:200", "i:201"]);
+        let moved = shard.anchors.get("i:202").unwrap().clone();
+        let node = moved.read();
+        let pos = node
+            .edge
+            .iter()
+            .position(|(seqs, _)| seqs.contains("i:202"))
+            .unwrap();
+        assert!(!node.claims[pos].contains(&kb));
+        assert!(node.claims[pos].contains(&ka));
+        drop(node);
+        let hits = idx.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&hits, "b", StorageTier::Device), 2);
+        assert_eq!(depth_of(&hits, "a", StorageTier::Device), 3);
+    }
+
+    #[test]
+    fn store_cursor_retries_stale_anchor_after_split() {
+        let idx = Arc::new(KvBlockIndexer::new());
+        let a = worker("a");
+        let b = worker("b");
+        for (owner, seqs) in [
+            (a.clone(), ["i:100", "i:101", "i:102"]),
+            (b.clone(), ["i:200", "i:201", "i:202"]),
+        ] {
+            idx.store(
+                0,
+                owner,
+                StorageTier::Device,
+                None,
+                &[
+                    (h(seqs[0]), h("x")),
+                    (h(seqs[1]), h("y")),
+                    (h(seqs[2]), h("z")),
+                ],
+            );
+        }
+        let shard = idx.shard(0);
+        let old_anchor = shard.anchors.get("i:201").unwrap().clone();
+        let split_index = idx.clone();
+        AFTER_ANCHOR_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                split_index.store(
+                    0,
+                    worker("a"),
+                    StorageTier::Device,
+                    None,
+                    &[(h("i:100"), h("x"))],
+                );
+                let moved = split_index.shard(0).anchors.get("i:201").unwrap().clone();
+                assert!(!Arc::ptr_eq(&old_anchor, &moved));
+                assert!(!old_anchor
+                    .read()
+                    .edge
+                    .iter()
+                    .any(|(seqs, _)| seqs.contains("i:201")));
+            }));
+        });
+        idx.store(
+            0,
+            b.clone(),
+            StorageTier::Device,
+            Some(h("i:201")),
+            &[(h("i:203"), h("branch"))],
+        );
+        let ka = (a, StorageTier::Device);
+        let kb = (b, StorageTier::Device);
+        assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
+        assert_observations(&shard, &kb, &["i:200", "i:201", "i:202", "i:203"]);
+        let branch = shard.anchors.get("i:203").unwrap().clone();
+        assert_eq!(branch.read().claims[0], vec![kb]);
+        let original = idx.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&original, "a", StorageTier::Device), 3);
+        assert_eq!(depth_of(&original, "b", StorageTier::Device), 3);
+        let extended = idx.find_matches(&query(&["x", "y", "branch"], &[StorageTier::Device]));
+        assert_eq!(depth_of(&extended, "a", StorageTier::Device), 2);
+        assert_eq!(depth_of(&extended, "b", StorageTier::Device), 3);
     }
 
     #[test]
