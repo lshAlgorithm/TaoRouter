@@ -172,6 +172,8 @@ impl GroupShard {
                 else {
                     // The same split-only progress argument as remove_claim
                     // applies to this fixed cursor; resolve its moved anchor.
+                    drop(parent);
+                    std::thread::yield_now();
                     continue;
                 };
                 if pos + 1 < parent.edge.len() {
@@ -339,6 +341,8 @@ impl GroupShard {
             let mut n = node.write();
             let Some(idx) = n.edge.iter().position(|(aliases, _)| aliases.contains(seq)) else {
                 // A concurrent split moved this alias; resolve it again.
+                drop(n);
+                std::thread::yield_now();
                 continue;
             };
             let active = self
@@ -496,6 +500,8 @@ impl crate::kv_index::TieredMatchProvider for KvBlockIndexer {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
     use crate::kv_index::types::SourceId;
 
@@ -700,6 +706,8 @@ mod tests {
         let shard = idx.shard(0);
         let old_anchor = shard.anchors.get("i:202").unwrap().clone();
         let split_index = idx.clone();
+        let retried = Rc::new(Cell::new(false));
+        let retry_observed = retried.clone();
         AFTER_ANCHOR_CLONE.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
                 // Legal interleaving: another owner splits after remove has
@@ -718,9 +726,13 @@ mod tests {
                     .edge
                     .iter()
                     .any(|(seqs, _)| seqs.contains("i:202")));
+                AFTER_ANCHOR_CLONE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || retry_observed.set(true)));
+                });
             }));
         });
         idx.remove(0, &b, StorageTier::Device, &[h("i:202")]);
+        assert!(retried.get());
         let ka = (a, StorageTier::Device);
         let kb = (b, StorageTier::Device);
         assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
@@ -764,6 +776,8 @@ mod tests {
         let shard = idx.shard(0);
         let old_anchor = shard.anchors.get("i:201").unwrap().clone();
         let split_index = idx.clone();
+        let retried = Rc::new(Cell::new(false));
+        let retry_observed = retried.clone();
         AFTER_ANCHOR_CLONE.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
                 split_index.store(
@@ -780,6 +794,9 @@ mod tests {
                     .edge
                     .iter()
                     .any(|(seqs, _)| seqs.contains("i:201")));
+                AFTER_ANCHOR_CLONE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || retry_observed.set(true)));
+                });
             }));
         });
         idx.store(
@@ -789,6 +806,7 @@ mod tests {
             Some(h("i:201")),
             &[(h("i:203"), h("branch"))],
         );
+        assert!(retried.get());
         let ka = (a, StorageTier::Device);
         let kb = (b, StorageTier::Device);
         assert_observations(&shard, &ka, &["i:100", "i:101", "i:102"]);
