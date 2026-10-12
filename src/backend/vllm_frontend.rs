@@ -13,7 +13,7 @@ use vllm_chat::{
 };
 use vllm_text::TextDecodeOptions;
 
-use super::l0::{deterministic_model, FrontendCache, PromptEncoder};
+use super::encode_cache::{deterministic_model, FrontendCache, PromptEncoder};
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;

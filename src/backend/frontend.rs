@@ -64,7 +64,7 @@ impl EngineFrontend {
     }
 
     pub(crate) fn from_env(request_timeout: Duration) -> anyhow::Result<Self> {
-        match super::l0::config_from_env()? {
+        match super::encode_cache::config_from_env()? {
             Some(config) => Self::with_tokenizer_cache(request_timeout, config),
             None => Ok(Self::with_request_timeout(request_timeout)),
         }

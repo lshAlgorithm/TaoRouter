@@ -1,4 +1,4 @@
-//! Shared L0 encoding cache for gRPC models.
+//! Shared prompt encoding cache.
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};

@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use super::l0::FrontendCache;
+use super::encode_cache::FrontendCache;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{

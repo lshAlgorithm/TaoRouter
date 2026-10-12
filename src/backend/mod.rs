@@ -18,10 +18,10 @@
 pub mod control;
 pub mod convert;
 pub mod detect;
+pub(crate) mod encode_cache;
 pub mod frontend;
 pub mod grpc;
 pub mod health;
-pub(crate) mod l0;
 pub mod openai;
 pub mod preprocess;
 mod vllm_frontend;
