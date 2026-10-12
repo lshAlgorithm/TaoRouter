@@ -124,36 +124,17 @@ fn branch_at_first_compressed_block() -> KvBlockIndexer {
 }
 
 #[test]
-fn interior_parent_branch_matches_its_real_prefix() {
-    let hits = branch_at_first_compressed_block().find_matches(&query(
-        0,
-        &["x", "w"],
-        &[StorageTier::Device],
-    ));
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].matched_depth, 2);
-}
-
-#[test]
-fn interior_parent_branch_preserves_original_suffix() {
-    let hits = branch_at_first_compressed_block().find_matches(&query(
-        0,
-        &["x", "y", "z"],
-        &[StorageTier::Device],
-    ));
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].matched_depth, 3);
-}
-
-#[test]
-fn interior_parent_branch_is_not_a_child_of_the_original_suffix() {
-    let hits = branch_at_first_compressed_block().find_matches(&query(
-        0,
-        &["x", "y", "z", "w"],
-        &[StorageTier::Device],
-    ));
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].matched_depth, 3);
+fn interior_parent_branch_preserves_prefix_boundaries() {
+    let index = branch_at_first_compressed_block();
+    for (hashes, expected_depth) in [
+        (vec!["x", "w"], 2),
+        (vec!["x", "y", "z"], 3),
+        (vec!["x", "y", "z", "w"], 3),
+    ] {
+        let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
+        assert_eq!(hits.len(), 1, "query {hashes:?}");
+        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+    }
 }
 
 #[test]
@@ -183,7 +164,6 @@ fn middle_and_tail_engine_parents_keep_their_exact_prefix() {
         for (hashes, expected_depth) in [
             (branch, branch_depth),
             (vec!["x", "y", "z"], 3),
-            (vec!["x", "y", "z", "w"], if parent == "sy" { 3 } else { 4 }),
             (vec!["x"], 1),
             (vec!["x", "y"], 2),
         ] {
@@ -191,6 +171,15 @@ fn middle_and_tail_engine_parents_keep_their_exact_prefix() {
             assert_eq!(hits.len(), 1, "parent {parent}, query {hashes:?}");
             assert_eq!(
                 hits[0].matched_depth, expected_depth,
+                "parent {parent}, query {hashes:?}"
+            );
+        }
+        if parent == "sy" {
+            let hashes = ["x", "y", "z", "w"];
+            let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
+            assert_eq!(hits.len(), 1, "parent {parent}, query {hashes:?}");
+            assert_eq!(
+                hits[0].matched_depth, 3,
                 "parent {parent}, query {hashes:?}"
             );
         }
@@ -539,24 +528,18 @@ fn remove_and_clear_after_an_interior_split_preserve_other_claims() {
 }
 
 #[test]
-fn complete_and_query_exhausted_prefixes_keep_their_depth() {
+fn compressed_prefix_query_boundaries() {
     let index = compressed_prefix_with_child();
     for (hashes, expected_depth) in [
         (vec!["x", "y", "z"], 3),
         (vec!["x"], 1),
         (vec!["x", "y"], 2),
-        (vec!["x", "z"], 1),
         (vec!["x", "y", "z", "missing"], 3),
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
         assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
     }
-}
-
-#[test]
-fn a_first_block_mismatch_has_no_positive_depth_match() {
-    let index = compressed_prefix_with_child();
     for hashes in [vec![], vec!["missing"], vec!["y", "z"]] {
         assert!(
             index

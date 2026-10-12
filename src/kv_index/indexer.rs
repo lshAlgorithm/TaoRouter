@@ -143,10 +143,11 @@ impl GroupShard {
         let mut bi = 0;
         while bi < blocks.len() {
             let node = match &cursor {
-                Some(seq) => match self.anchors.get(seq) {
-                    Some(node) => node.clone(),
-                    None => continue,
-                },
+                Some(seq) => self
+                    .anchors
+                    .get(seq)
+                    .map(|node| node.clone())
+                    .expect("known cursor must remain anchored; anchors are insert-only"),
                 None => self.root.clone(),
             };
             #[cfg(test)]
@@ -179,6 +180,7 @@ impl GroupShard {
             // can't shorten this edge between the match and the split.
             let mut c = child.write();
             let matched = edge_common_prefix(&c.edge, &blocks[bi..]);
+            debug_assert!(matched >= 1, "child key matches its first edge block");
             if matched < c.edge.len() {
                 self.split_locked(&mut c, matched);
             }
