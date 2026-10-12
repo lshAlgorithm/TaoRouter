@@ -151,6 +151,21 @@ mod tests {
                 "{host}"
             );
         }
+        let workers = vec![
+            "http://127.0.0.1:8000".to_string(),
+            "http://[::ffff:127.0.0.1]:8000".to_string(),
+        ];
+        let mappings: Vec<_> = workers
+            .iter()
+            .zip(["tcp://127.0.0.1:5557", "tcp://[::ffff:127.0.0.1]:5557"])
+            .map(|(worker, endpoint)| {
+                parse_endpoint_mapping(&format!("{worker}={endpoint}")).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            resolve_endpoints(&workers, &mappings, 5559),
+            Err("workers cannot share KV endpoint tcp://127.0.0.1:5557; configure explicit per-worker endpoints".into())
+        );
     }
 
     #[test]
@@ -218,6 +233,24 @@ mod tests {
         assert_eq!(
             resolve_endpoints(&workers, &mappings[..1], 5558).unwrap(),
             expected
+        );
+        let workers = vec![
+            "HTTP://127.0.0.1:8000/".to_string(),
+            "HTTP://[0:0:0:0:0:FFFF:7F00:1]:8000/".to_string(),
+        ];
+        let mappings: Vec<_> = workers
+            .iter()
+            .zip(["tcp://127.0.0.1:5557", "tcp://[::ffff:127.0.0.1]:5558"])
+            .map(|(worker, endpoint)| {
+                parse_endpoint_mapping(&format!("{worker}={endpoint}")).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            resolve_endpoints(&workers, &mappings, 5559).unwrap(),
+            vec![
+                (workers[0].clone(), "tcp://127.0.0.1:5557".into()),
+                (workers[1].clone(), "tcp://127.0.0.1:5558".into()),
+            ]
         );
     }
 
@@ -293,17 +326,53 @@ mod tests {
 
     #[test]
     fn connect_endpoints_reject_wildcard_and_unspecified_hosts() {
-        for host in ["*", "0.0.0.0", "[::]", "0", "0x0"] {
-            assert!(
-                parse_endpoint_mapping(&format!("http://worker:8000=tcp://{host}:5557")).is_err(),
-                "explicit: {host}"
+        for host in [
+            "*",
+            "0.0.0.0",
+            "0",
+            "0x0",
+            "[::]",
+            "[::ffff:0.0.0.0]",
+            "[::ffff:0:0]",
+        ] {
+            let error = if host == "*" {
+                "KV connect host cannot be a wildcard"
+            } else {
+                "KV connect host cannot be unspecified"
+            };
+            assert_eq!(
+                parse_endpoint_mapping(&format!("http://worker:8000=tcp://{host}:5557")),
+                Err(error.into()),
+                "publisher parse: {host}"
             );
             let mappings = vec![("http://worker:8000".into(), format!("tcp://{host}:5557"))];
-            assert!(resolve_endpoints(&["http://worker:8000".into()], &mappings, 5557).is_err());
-            assert!(
-                resolve_endpoints(&[format!("http://{host}:8000")], &[], 5557).is_err(),
-                "fallback: {host}"
+            assert_eq!(
+                resolve_endpoints(&["http://worker:8000".into()], &mappings, 5557),
+                Err(error.into()),
+                "raw publisher mapping: {host}"
             );
+            for scheme in ["http", "https"] {
+                let worker = format!("{scheme}://{host}:8000");
+                assert_eq!(
+                    parse_endpoint_mapping(&format!("{worker}=tcp://publisher:5557")),
+                    Err(error.into()),
+                    "worker parse: {worker}"
+                );
+                assert_eq!(
+                    resolve_endpoints(
+                        std::slice::from_ref(&worker),
+                        &[(worker.clone(), "tcp://publisher:5557".into())],
+                        5558,
+                    ),
+                    Err(error.into()),
+                    "raw worker mapping: {worker}"
+                );
+                assert_eq!(
+                    resolve_endpoints(std::slice::from_ref(&worker), &[], 5557),
+                    Err(error.into()),
+                    "worker fallback: {worker}"
+                );
+            }
         }
     }
 
