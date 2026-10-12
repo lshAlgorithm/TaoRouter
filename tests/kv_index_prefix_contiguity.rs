@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use vllm_router_rs::kv_index::{KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier};
+use vllm_router_rs::kv_index::{
+    ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier,
+};
 
 #[test]
 fn a_partial_compressed_edge_match_must_not_skip_to_its_child() {
@@ -96,6 +98,444 @@ fn compressed_prefix_with_child() -> KvBlockIndexer {
         &[("s3", "z")],
     );
     index
+}
+
+fn branch_at_first_compressed_block() -> KvBlockIndexer {
+    let index = KvBlockIndexer::new();
+    let owner = worker("worker", 0);
+    // No other insertion may split this edge before the engine parent is used.
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        None,
+        &[("sx", "x"), ("sy", "y"), ("sz", "z")],
+    );
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        Some("sx"),
+        &[("sw", "w")],
+    );
+    index
+}
+
+#[test]
+fn interior_parent_branch_matches_its_real_prefix() {
+    let hits = branch_at_first_compressed_block().find_matches(&query(
+        0,
+        &["x", "w"],
+        &[StorageTier::Device],
+    ));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_depth, 2);
+}
+
+#[test]
+fn interior_parent_branch_preserves_original_suffix() {
+    let hits = branch_at_first_compressed_block().find_matches(&query(
+        0,
+        &["x", "y", "z"],
+        &[StorageTier::Device],
+    ));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_depth, 3);
+}
+
+#[test]
+fn interior_parent_branch_is_not_a_child_of_the_original_suffix() {
+    let hits = branch_at_first_compressed_block().find_matches(&query(
+        0,
+        &["x", "y", "z", "w"],
+        &[StorageTier::Device],
+    ));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].matched_depth, 3);
+}
+
+#[test]
+fn middle_and_tail_engine_parents_keep_their_exact_prefix() {
+    let owner = worker("worker", 0);
+    for (parent, branch, branch_depth) in [
+        ("sy", vec!["x", "y", "w"], 3),
+        ("sz", vec!["x", "y", "z", "w"], 4),
+    ] {
+        let index = KvBlockIndexer::new();
+        store(
+            &index,
+            0,
+            &owner,
+            StorageTier::Device,
+            None,
+            &[("sx", "x"), ("sy", "y"), ("sz", "z")],
+        );
+        store(
+            &index,
+            0,
+            &owner,
+            StorageTier::Device,
+            Some(parent),
+            &[("sw", "w")],
+        );
+        for (hashes, expected_depth) in [
+            (branch, branch_depth),
+            (vec!["x", "y", "z"], 3),
+            (vec!["x", "y", "z", "w"], if parent == "sy" { 3 } else { 4 }),
+            (vec!["x"], 1),
+            (vec!["x", "y"], 2),
+        ] {
+            let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
+            assert_eq!(hits.len(), 1, "parent {parent}, query {hashes:?}");
+            assert_eq!(
+                hits[0].matched_depth, expected_depth,
+                "parent {parent}, query {hashes:?}"
+            );
+        }
+        assert!(index
+            .find_matches(&query(0, &["w"], &[StorageTier::Device]))
+            .is_empty());
+    }
+}
+
+#[test]
+fn existing_interior_branch_is_idempotent_and_extends_contiguously() {
+    let index = branch_at_first_compressed_block();
+    let owner = worker("worker", 0);
+    for _ in 0..2 {
+        store(
+            &index,
+            0,
+            &owner,
+            StorageTier::Device,
+            Some("sx"),
+            &[("sw", "w")],
+        );
+        store(
+            &index,
+            0,
+            &owner,
+            StorageTier::Device,
+            Some("sx"),
+            &[("sw", "w"), ("sv", "v")],
+        );
+        store(
+            &index,
+            0,
+            &owner,
+            StorageTier::Device,
+            Some("sv"),
+            &[("su", "u")],
+        );
+    }
+    for (hashes, expected_depth) in [
+        (vec!["x", "w"], 2),
+        (vec!["x", "w", "v", "u"], 4),
+        (vec!["x", "w", "u"], 2),
+        (vec!["x", "y", "z"], 3),
+        (vec!["x", "y", "z", "w"], 3),
+    ] {
+        let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
+        assert_eq!(hits.len(), 1, "query {hashes:?}");
+        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+    }
+}
+
+#[test]
+fn repeated_local_hashes_have_distinct_interior_engine_parents() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("worker", 0);
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        None,
+        &[("sx1", "x"), ("sy", "y"), ("sx2", "x"), ("sz", "z")],
+    );
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        Some("sx1"),
+        &[("sw", "w")],
+    );
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        Some("sx2"),
+        &[("sv", "v")],
+    );
+    for (hashes, expected_depth) in [
+        (vec!["x", "w"], 2),
+        (vec!["x", "y", "x", "v"], 4),
+        (vec!["x", "y", "x", "z"], 4),
+        (vec!["x", "v"], 1),
+        (vec!["x", "y", "x", "w"], 3),
+        (vec!["x", "y", "x", "z", "v"], 4),
+    ] {
+        let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
+        assert_eq!(hits.len(), 1, "query {hashes:?}");
+        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+    }
+}
+
+#[test]
+fn interior_parent_splits_preserve_children_and_relocate_suffix_anchors() {
+    let index = KvBlockIndexer::new();
+    let owner = worker("worker", 0);
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        None,
+        &[("sx", "x"), ("sy", "y"), ("sz", "z")],
+    );
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        Some("sz"),
+        &[("sa", "a"), ("sb", "b")],
+    );
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        Some("sx"),
+        &[("sw", "w")],
+    );
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        Some("sy"),
+        &[("sq", "q")],
+    );
+    store(
+        &index,
+        0,
+        &owner,
+        StorageTier::Device,
+        Some("sb"),
+        &[("sc", "c")],
+    );
+    for (hashes, expected_depth) in [
+        (vec!["x", "w"], 2),
+        (vec!["x", "y", "q"], 3),
+        (vec!["x", "y", "z", "a", "b", "c"], 6),
+        (vec!["x", "y", "z", "w"], 3),
+        (vec!["x", "y", "z", "a", "c"], 4),
+    ] {
+        let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
+        assert_eq!(hits.len(), 1, "query {hashes:?}");
+        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+    }
+}
+
+#[test]
+fn interior_parent_split_preserves_isolated_owner_rank_tier_and_group_claims() {
+    let index = KvBlockIndexer::new();
+    let original = worker("worker", 0);
+    let other_worker = worker("other", 0);
+    let other_rank = worker("worker", 1);
+    let pool = ResidencyOwner::CacheOwner {
+        pool_id: Arc::from("pool"),
+        source: Arc::from("worker"),
+        dp_rank: 0,
+    };
+    let claims = [
+        (&original, StorageTier::Device),
+        (&other_worker, StorageTier::Device),
+        (&other_rank, StorageTier::Device),
+        (&original, StorageTier::HostPinned),
+        (&pool, StorageTier::External),
+    ];
+    for (owner, tier) in claims {
+        // All claims share the same engine identities, not separate aliases.
+        store(
+            &index,
+            0,
+            owner,
+            tier,
+            None,
+            &[("sx", "x"), ("sy", "y"), ("sz", "z")],
+        );
+    }
+    store(
+        &index,
+        0,
+        &original,
+        StorageTier::Device,
+        Some("sx"),
+        &[("sw", "w")],
+    );
+    store(
+        &index,
+        1,
+        &other_worker,
+        StorageTier::Device,
+        None,
+        &[("sx", "x"), ("sw", "w")],
+    );
+    let tiers = [
+        StorageTier::Device,
+        StorageTier::HostPinned,
+        StorageTier::External,
+    ];
+    for (hashes, original_depth, other_depth) in [
+        (vec!["x", "w"], 2, 1),
+        (vec!["x", "y", "z"], 3, 3),
+        (vec!["x", "y", "z", "w"], 3, 3),
+    ] {
+        let hits = index.find_matches(&query(0, &hashes, &tiers));
+        assert_eq!(hits.len(), claims.len(), "query {hashes:?}");
+        for (owner, tier) in claims {
+            let hit = hits
+                .iter()
+                .find(|hit| hit.target == owner.target() && hit.tier == tier)
+                .expect("every original claim survives the split");
+            let expected_depth = if owner == &original && tier == StorageTier::Device {
+                original_depth
+            } else {
+                other_depth
+            };
+            assert_eq!(
+                hit.matched_depth, expected_depth,
+                "{owner:?}/{tier:?}: {hashes:?}"
+            );
+        }
+    }
+    let host_hits = index.find_matches(&query(0, &["x", "w"], &[StorageTier::HostPinned]));
+    assert_eq!(host_hits.len(), 1);
+    assert_eq!(host_hits[0].matched_depth, 1);
+    let group_hits = index.find_matches(&query(1, &["x", "w"], &[StorageTier::Device]));
+    assert_eq!(group_hits.len(), 1);
+    assert_eq!(group_hits[0].target, other_worker.target());
+    assert_eq!(group_hits[0].matched_depth, 2);
+    assert!(index
+        .find_matches(&query(2, &["x", "w"], &tiers))
+        .is_empty());
+}
+
+#[test]
+fn remove_and_clear_after_an_interior_split_preserve_other_claims() {
+    let index = branch_at_first_compressed_block();
+    let original = worker("worker", 0);
+    let other_rank = worker("worker", 1);
+    let pool = ResidencyOwner::CacheOwner {
+        pool_id: Arc::from("pool"),
+        source: Arc::from("worker"),
+        dp_rank: 0,
+    };
+    for (owner, tier) in [
+        (&other_rank, StorageTier::Device),
+        (&original, StorageTier::HostPinned),
+        (&pool, StorageTier::External),
+    ] {
+        store(
+            &index,
+            0,
+            owner,
+            tier,
+            None,
+            &[("sx", "x"), ("sy", "y"), ("sz", "z")],
+        );
+        store(&index, 0, owner, tier, Some("sx"), &[("sw", "w")]);
+    }
+    store(
+        &index,
+        1,
+        &original,
+        StorageTier::Device,
+        None,
+        &[("sx", "x"), ("sw", "w")],
+    );
+    index.remove(0, &original, StorageTier::Device, &[Arc::from("sy")]);
+    for (hashes, original_depth, rank_depth) in
+        [(vec!["x", "y", "z"], 1, 3), (vec!["x", "w"], 2, 2)]
+    {
+        let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
+        assert_eq!(hits.len(), 2, "query {hashes:?}");
+        for (owner, depth) in [(&original, original_depth), (&other_rank, rank_depth)] {
+            let hit = hits
+                .iter()
+                .find(|hit| hit.target == owner.target())
+                .expect("both ranks hold x");
+            assert_eq!(hit.matched_depth, depth, "{owner:?}: {hashes:?}");
+        }
+    }
+    index.remove(0, &original, StorageTier::Device, &[Arc::from("sw")]);
+    let branch_hits = index.find_matches(&query(0, &["x", "w"], &[StorageTier::Device]));
+    assert_eq!(branch_hits.len(), 2);
+    assert_eq!(
+        branch_hits
+            .iter()
+            .find(|hit| hit.target == original.target())
+            .unwrap()
+            .matched_depth,
+        1
+    );
+    assert_eq!(
+        branch_hits
+            .iter()
+            .find(|hit| hit.target == other_rank.target())
+            .unwrap()
+            .matched_depth,
+        2
+    );
+    for hashes in [vec!["x", "w"], vec!["x", "y", "z"]] {
+        let host_hits = index.find_matches(&query(0, &hashes, &[StorageTier::HostPinned]));
+        assert_eq!(host_hits.len(), 1);
+        assert_eq!(host_hits[0].matched_depth as usize, hashes.len());
+    }
+    index.clear(&original, ClearScope::Worker);
+    for hashes in [vec!["x", "w"], vec!["x", "y", "z"]] {
+        let hits = index.find_matches(&query(
+            0,
+            &hashes,
+            &[
+                StorageTier::Device,
+                StorageTier::HostPinned,
+                StorageTier::External,
+            ],
+        ));
+        assert_eq!(hits.len(), 2, "query {hashes:?}");
+        for (owner, tier) in [
+            (&other_rank, StorageTier::Device),
+            (&pool, StorageTier::External),
+        ] {
+            let hit = hits
+                .iter()
+                .find(|hit| hit.target == owner.target() && hit.tier == tier)
+                .expect("rank and cache-owner claims survive worker clear");
+            assert_eq!(
+                hit.matched_depth as usize,
+                hashes.len(),
+                "{owner:?}/{tier:?}: {hashes:?}"
+            );
+        }
+    }
+    assert!(index
+        .find_matches(&query(1, &["x", "w"], &[StorageTier::Device]))
+        .is_empty());
+    index.clear(&pool, ClearScope::CacheOwner);
+    assert!(index
+        .find_matches(&query(0, &["x", "w"], &[StorageTier::External]))
+        .is_empty());
+    let remaining = index.find_matches(&query(0, &["x", "w"], &[StorageTier::Device]));
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].target, other_rank.target());
+    assert_eq!(remaining[0].matched_depth, 2);
 }
 
 #[test]
