@@ -74,11 +74,12 @@ The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
 - `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
   RDMA backend.
 
-The xGMI group is temporarily disabled — commented out in `pipeline.yml` —
-because the MI300X host readiness gate cannot find the digest-pinned ROCm
-image and fails every build before any test runs
-(https://github.com/vllm-project/router/issues/363). When re-enabled, it runs
-for same-repository pull requests, the default branch, and merge-queue
+The xGMI group is temporarily disabled — pinned to a never-true `if`
+condition in `pipeline.yml`, with the original triggers kept in a comment for
+a minimal-diff restore — because the MI300X host readiness gate cannot find
+the digest-pinned ROCm image and fails every build before any test runs
+(https://github.com/vllm-project/router/issues/363). When re-enabled, it
+runs for same-repository pull requests, the default branch, and merge-queue
 builds; trusted manual/API builds can set `RUN_ROCM_XGMI=1`. The RDMA matrix
 runs for scheduled builds with `NIGHTLY=1`, or trusted manual/API builds with
 `RUN_ROCM_RDMA=1`. When active, group-level filtering prevents Docker plugin
