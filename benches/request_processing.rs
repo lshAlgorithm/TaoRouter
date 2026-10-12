@@ -525,7 +525,7 @@ fn benchmark_summary(c: &mut Criterion) {
 
     println!("\nPerformance Insights:");
     if deserialize_time > serialize_time * 2 {
-        println!("  • Deserialization is significantly faster than serialization");
+        println!("  • Serialization is significantly faster than deserialization");
     }
     if total_pipeline < 100_000 {
         println!("  • Total pipeline latency is excellent (< 100μs)");
