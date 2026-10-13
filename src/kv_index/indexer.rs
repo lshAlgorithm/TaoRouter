@@ -129,7 +129,8 @@ impl GroupShard {
 
     /// Idempotent link of a batch to (owner, tier). Each block is a
     /// `(seq_hash, local_hash)` pair. Starting at the parent anchor (or root),
-    /// the incoming blocks are matched against each child's edge: on a full
+    /// split after an interior parent block before following its children.
+    /// Incoming blocks are matched against each child's edge: on a full
     /// edge match we record the edge and descend; on a partial match we split
     /// the edge at the divergence, record the shared prefix, then append a new
     /// child for the diverging remainder; on no child we append a new child
@@ -157,10 +158,14 @@ impl GroupShard {
         });
         let mut bi = 0;
         while bi < blocks.len() {
-            let node = cursor
-                .as_ref()
-                .and_then(|seq| self.anchors.get(seq).map(|n| n.clone()))
-                .unwrap_or_else(|| self.root.clone());
+            let node = match &cursor {
+                Some(seq) => self
+                    .anchors
+                    .get(seq)
+                    .map(|node| node.clone())
+                    .expect("known cursor must remain anchored; anchors are insert-only"),
+                None => self.root.clone(),
+            };
             #[cfg(test)]
             after_anchor_clone();
             let mut parent = node.write();
@@ -193,13 +198,18 @@ impl GroupShard {
                 return;
             };
             drop(parent);
+            // Match, split, and claim under one write lock: a concurrent split
+            // can't shorten this edge between the match and the split.
             let mut c = child.write();
             let matched = edge_common_prefix(&c.edge, &blocks[bi..]);
+            debug_assert!(matched >= 1, "child key matches its first edge block");
             if matched < c.edge.len() {
                 self.split_locked(&mut c, matched);
             }
             self.record_locked(&mut c, &child, &key, &blocks[bi..bi + matched]);
             bi += matched;
+            // record_locked registered this incoming key, so its current
+            // anchor remains a valid cursor even if a later split moves it.
             cursor = Some(blocks[bi - 1].0.clone());
         }
     }
@@ -246,12 +256,15 @@ impl GroupShard {
             claims: rem_claims,
             children: old_children,
         }));
-        for (aliases, _) in &rem_node.read().edge {
+        // An anchor exposes the remainder to other writers. Keep it locked
+        // through all re-anchoring and publication so a split cannot race us.
+        let r = rem_node.write();
+        for (aliases, _) in &r.edge {
             for seq in aliases {
                 self.anchors.insert(seq.clone(), rem_node.clone());
             }
         }
-        c.children.insert(rem_first, rem_node);
+        c.children.insert(rem_first, rem_node.clone());
     }
 
     /// Drop `owner`'s claim on `seq_hashes` at `tier`. Each seq hash resolves
@@ -376,7 +389,7 @@ impl GroupShard {
             };
             // Match under the read guard and copy only matching claims, never
             // the potentially unbounded historical identity sets.
-            let advanced = {
+            let (advanced, fully_matched) = {
                 let c = child.read();
                 let mut advanced = 0;
                 while advanced < c.edge.len()
@@ -386,9 +399,10 @@ impl GroupShard {
                     node_claims.push(c.claims[advanced].clone());
                     advanced += 1;
                 }
-                advanced
+                (advanced, advanced == c.edge.len())
             };
-            if advanced == 0 {
+            // Retain the matched prefix, but never skip an unmatched edge suffix.
+            if !fully_matched {
                 break;
             }
             qi += advanced;
@@ -1351,6 +1365,269 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[test]
+    fn store_resumes_from_registered_incoming_seq_after_full_and_partial_matches() {
+        for original in [
+            vec![(h("sx"), h("x")), (h("sy"), h("y"))],
+            vec![(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
+        ] {
+            let shard = GroupShard::new();
+            let key = (worker("w0"), StorageTier::Device);
+            shard.store(worker("w0"), StorageTier::Device, None, &original);
+            shard.store(
+                worker("w0"),
+                StorageTier::Device,
+                None,
+                &[
+                    (h("incoming-x"), h("x")),
+                    (h("incoming-y"), h("y")),
+                    (h("sw"), h("w")),
+                ],
+            );
+
+            assert_eq!(
+                depth_of(
+                    &shard.find_matches(&query(&["x", "y", "w"], &[StorageTier::Device])),
+                    "w0",
+                    StorageTier::Device,
+                ),
+                3
+            );
+            assert_eq!(
+                depth_of(
+                    &shard.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device])),
+                    "w0",
+                    StorageTier::Device,
+                ),
+                original.len() as u32
+            );
+            assert!(shard.anchors.contains_key("incoming-x"));
+            assert!(shard.anchors.contains_key("incoming-y"));
+            assert!(!shard.root.read().children.contains_key("w"));
+            // Matching local hashes registers incoming observations alongside
+            // the original identities, rather than only claiming stored keys.
+            let mut expected: Vec<&str> = original
+                .iter()
+                .map(|(seq, _)| seq.as_ref())
+                .chain(["incoming-x", "incoming-y", "sw"])
+                .collect();
+            assert_observations(&shard, &key, &expected);
+
+            shard.remove(&key.0, key.1, &[h("incoming-y")]);
+            expected.retain(|seq| *seq != "incoming-y");
+            assert_observations(&shard, &key, &expected);
+            let y = shard.anchors.get("sy").unwrap().clone();
+            let y_pos = y
+                .read()
+                .edge
+                .iter()
+                .position(|(seqs, _)| seqs.contains("sy"))
+                .unwrap();
+            assert!(y.read().claims[y_pos].contains(&key));
+            for (hashes, depth) in [
+                (vec!["x", "y", "w"], 3),
+                (vec!["x", "y", "z"], original.len() as u32),
+            ] {
+                assert_eq!(
+                    depth_of(
+                        &shard.find_matches(&query(&hashes, &[StorageTier::Device])),
+                        "w0",
+                        StorageTier::Device,
+                    ),
+                    depth
+                );
+            }
+
+            shard.remove(&key.0, key.1, &[h("sy")]);
+            expected.retain(|seq| *seq != "sy");
+            assert_observations(&shard, &key, &expected);
+            assert!(!y.read().claims[y_pos].contains(&key));
+            for hashes in [["x", "y", "w"], ["x", "y", "z"]] {
+                assert_eq!(
+                    depth_of(
+                        &shard.find_matches(&query(&hashes, &[StorageTier::Device])),
+                        "w0",
+                        StorageTier::Device,
+                    ),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn store_retries_new_incoming_cursor_moved_before_lock() {
+        let shard = Arc::new(GroupShard::new());
+        let key = (worker("w0"), StorageTier::Device);
+        let splitter_key = (worker("splitter"), StorageTier::Device);
+        shard.store(
+            key.0.clone(),
+            key.1,
+            None,
+            &[(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
+        );
+        let split_shard = shard.clone();
+        let retried = Rc::new(Cell::new(false));
+        let retry_observed = retried.clone();
+        AFTER_ANCHOR_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // The root lookup happens before the incoming keys are
+                // registered. Interleave on the next, incoming-y lookup.
+                AFTER_ANCHOR_CLONE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        let key = (worker("w0"), StorageTier::Device);
+                        assert_observations(
+                            &split_shard,
+                            &key,
+                            &["sx", "sy", "sz", "incoming-x", "incoming-y"],
+                        );
+                        let old_anchor = split_shard.anchors.get("incoming-y").unwrap().clone();
+                        split_shard.store(
+                            worker("splitter"),
+                            StorageTier::Device,
+                            None,
+                            &[(h("split-x"), h("x"))],
+                        );
+                        let moved = split_shard.anchors.get("incoming-y").unwrap().clone();
+                        assert!(!Arc::ptr_eq(&old_anchor, &moved));
+                        assert!(!old_anchor
+                            .read()
+                            .edge
+                            .iter()
+                            .any(|(seqs, _)| seqs.contains("incoming-y")));
+                        assert!(moved.read().edge[0].0.contains("incoming-y"));
+                        assert!(moved.read().edge[0].0.contains("sy"));
+                        AFTER_ANCHOR_CLONE.with(|slot| {
+                            *slot.borrow_mut() = Some(Box::new(move || retry_observed.set(true)));
+                        });
+                    }));
+                });
+            }));
+        });
+        shard.store(
+            key.0.clone(),
+            key.1,
+            None,
+            &[
+                (h("incoming-x"), h("x")),
+                (h("incoming-y"), h("y")),
+                (h("sw"), h("w")),
+            ],
+        );
+        assert!(retried.get());
+        assert_observations(
+            &shard,
+            &key,
+            &["sx", "sy", "sz", "incoming-x", "incoming-y", "sw"],
+        );
+        assert_observations(&shard, &splitter_key, &["split-x"]);
+        for (hashes, expected) in [
+            (vec!["x", "y", "w"], 3),
+            (vec!["x", "y", "z"], 3),
+            (vec!["x", "y", "z", "w"], 3),
+            (vec!["w"], 0),
+        ] {
+            assert_eq!(
+                depth_of(
+                    &shard.find_matches(&query(&hashes, &[StorageTier::Device])),
+                    "w0",
+                    StorageTier::Device,
+                ),
+                expected,
+                "query {hashes:?}"
+            );
+        }
+        assert_eq!(
+            depth_of(
+                &shard.find_matches(&query(&["x", "y", "w"], &[StorageTier::Device])),
+                "splitter",
+                StorageTier::Device,
+            ),
+            1
+        );
+        assert!(!shard.root.read().children.contains_key("w"));
+    }
+
+    #[test]
+    fn store_re_resolves_parent_moved_by_concurrent_split() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let shard = Arc::new(GroupShard::new());
+        shard.store(
+            worker("w0"),
+            StorageTier::Device,
+            None,
+            &[(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
+        );
+        let old_anchor = shard.anchors.get("sy").unwrap().clone();
+        let timeout = Duration::from_secs(10);
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (stored_tx, stored_rx) = mpsc::channel();
+        let writer_shard = shard.clone();
+        let writer = std::thread::spawn(move || {
+            AFTER_ANCHOR_CLONE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    resolved_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(timeout).unwrap();
+                }));
+            });
+            writer_shard.store(
+                worker("w0"),
+                StorageTier::Device,
+                Some(h("sy")),
+                &[(h("sw"), h("w"))],
+            );
+            stored_tx.send(()).unwrap();
+        });
+        resolved_rx.recv_timeout(timeout).unwrap();
+
+        // Split after x while the other store has cloned sy's old anchor but
+        // has not locked it. A separate completion channel bounds deadlocks.
+        let (split_tx, split_rx) = mpsc::channel();
+        let splitter_shard = shard.clone();
+        let splitter = std::thread::spawn(move || {
+            splitter_shard.store(
+                worker("w0"),
+                StorageTier::Device,
+                None,
+                &[(h("sx"), h("x"))],
+            );
+            split_tx.send(()).unwrap();
+        });
+        split_rx.recv_timeout(timeout).unwrap();
+        let moved_anchor = shard.anchors.get("sy").unwrap().clone();
+        assert!(!Arc::ptr_eq(&old_anchor, &moved_anchor));
+        assert!(!old_anchor
+            .read()
+            .edge
+            .iter()
+            .any(|(seqs, _)| seqs.contains("sy")));
+        resume_tx.send(()).unwrap();
+        stored_rx.recv_timeout(timeout).unwrap();
+        writer.join().unwrap();
+        splitter.join().unwrap();
+
+        for (hashes, expected) in [
+            (vec!["x", "y", "w"], 3),
+            (vec!["x", "y", "z"], 3),
+            (vec!["x", "y", "z", "w"], 3),
+            (vec!["w"], 0),
+        ] {
+            assert_eq!(
+                depth_of(
+                    &shard.find_matches(&query(&hashes, &[StorageTier::Device])),
+                    "w0",
+                    StorageTier::Device,
+                ),
+                expected,
+                "query {hashes:?}"
+            );
+        }
+        assert!(!shard.root.read().children.contains_key("w"));
     }
 
     #[test]
