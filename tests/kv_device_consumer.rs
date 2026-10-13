@@ -149,7 +149,7 @@ fn same_source_rank_remove_and_clear_are_isolated() {
         dp_rank: 0,
         incarnation: 9,
     };
-    let depths = || {
+    let segments = || {
         let mut hits: Vec<_> = index
             .find_matches(&MatchQuery {
                 group_idx: 0,
@@ -159,7 +159,7 @@ fn same_source_rank_remove_and_clear_are_isolated() {
             .into_iter()
             .map(|hit| {
                 assert_eq!(hit.target.instance_id.as_ref(), "publisher-A");
-                (hit.target.dp_rank, hit.matched_depth)
+                (hit.target.dp_rank, hit.segments)
             })
             .collect();
         hits.sort_unstable();
@@ -174,13 +174,13 @@ fn same_source_rank_remove_and_clear_are_isolated() {
             &decoded_event(stored_event(), Some(rank.into())),
         );
     }
-    assert_eq!(depths(), vec![(0, 2), (7, 2)]);
+    assert_eq!(segments(), vec![(0, vec![(0, 2)]), (7, vec![(0, 2)])]);
     apply(
         &index,
         &configured,
         &decoded_event(removed_event(), Some(0.into())),
     );
-    assert_eq!(depths(), vec![(0, 1), (7, 2)]);
+    assert_eq!(segments(), vec![(0, vec![(0, 1)]), (7, vec![(0, 2)])]);
     apply(
         &index,
         &configured,
@@ -191,13 +191,13 @@ fn same_source_rank_remove_and_clear_are_isolated() {
         &configured,
         &decoded_event(removed_event(), Some(7.into())),
     );
-    assert_eq!(depths(), vec![(0, 2), (7, 1)]);
+    assert_eq!(segments(), vec![(0, vec![(0, 2)]), (7, vec![(0, 1)])]);
     apply(
         &index,
         &configured,
         &decoded_event(cleared_event(), Some(7.into())),
     );
-    assert_eq!(depths(), vec![(0, 2)]);
+    assert_eq!(segments(), vec![(0, vec![(0, 2)])]);
     apply(
         &index,
         &configured,
@@ -208,7 +208,7 @@ fn same_source_rank_remove_and_clear_are_isolated() {
         &configured,
         &decoded_event(cleared_event(), Some(0.into())),
     );
-    assert_eq!(depths(), vec![(7, 2)]);
+    assert_eq!(segments(), vec![(7, vec![(0, 2)])]);
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn absent_rank_uses_configured_source_and_explicit_zero_overrides_it() {
         let hits = index.find_matches(&query);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].target.dp_rank, expected_rank.unwrap_or(7));
-        assert_eq!(hits[0].matched_depth, 2);
+        assert_eq!(hits[0].segments, vec![(0, 2)]);
         apply(
             &index,
             &configured,
@@ -245,7 +245,7 @@ fn absent_rank_uses_configured_source_and_explicit_zero_overrides_it() {
         let hits = index.find_matches(&query);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].target.dp_rank, expected_rank.unwrap_or(7));
-        assert_eq!(hits[0].matched_depth, 1);
+        assert_eq!(hits[0].segments, vec![(0, 1)]);
         apply(
             &index,
             &configured,
@@ -349,7 +349,7 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
     apply(&index, &owner, &batch);
     let hits = provider.find_tiered_matches(&query);
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].matched_depth, 2); // Observation blocks, never reusable tokens.
+    assert_eq!(hits[0].segments, vec![(0, 2)]); // Observation blocks, never reusable tokens.
     assert_eq!(hits[0].target.instance_id.as_ref(), "publisher-A");
     // A routing integration must bind this source to its actual target.
     let local = local_keys(&tokens);
@@ -358,7 +358,10 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
         opaque(&ExternalBlockHash::Bytes(sequences[0].to_vec()))
     );
     apply(&index, &owner, &batch); // Idempotent announcement.
-    assert_eq!(provider.find_tiered_matches(&query)[0].matched_depth, 2);
+    assert_eq!(
+        provider.find_tiered_matches(&query)[0].segments,
+        vec![(0, 2)]
+    );
     let other_owner = ResidencyOwner::Worker {
         source: Arc::from("publisher-B"),
         dp_rank: 0,
@@ -372,8 +375,8 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
             hits.iter()
                 .find(|hit| hit.target.instance_id.as_ref() == worker)
                 .unwrap()
-                .matched_depth,
-            2
+                .segments,
+            vec![(0, 2)]
         );
     }
 
@@ -396,13 +399,13 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
     apply(&index, &owner, &removed);
     let hits = provider.find_tiered_matches(&query);
     assert_eq!(hits.len(), 2);
-    for (worker, depth) in [("publisher-A", 1), ("publisher-B", 2)] {
+    for (worker, end) in [("publisher-A", 1), ("publisher-B", 2)] {
         assert_eq!(
             hits.iter()
                 .find(|hit| hit.target.instance_id.as_ref() == worker)
                 .unwrap()
-                .matched_depth,
-            depth
+                .segments,
+            vec![(0, end)]
         );
     }
 
@@ -422,5 +425,5 @@ fn decode_admit_store_query_remove_and_clear_use_the_common_contract() {
     let hits = provider.find_tiered_matches(&query);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].target.instance_id.as_ref(), "publisher-B");
-    assert_eq!(hits[0].matched_depth, 2);
+    assert_eq!(hits[0].segments, vec![(0, 2)]);
 }
