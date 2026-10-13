@@ -118,7 +118,7 @@ fn decode_event(event: Value) -> Result<KVEvent, String> {
         "AllBlocksCleared" => (&["type"], &[]),
         _ => return Err(format!("unsupported KV event type: {kind}")),
     };
-    if let Some(key) = keys.iter().find(|key| !allowed.contains(key)) {
+    if let Some(key) = keys.iter().filter(|key| !allowed.contains(key)).min() {
         return Err(format!("unsupported KV event field: {key}"));
     }
     if let Some(key) = required.iter().find(|key| !keys.contains(**key)) {
@@ -294,22 +294,75 @@ mod tests {
     }
 
     #[test]
-    fn malformed_lifecycle_rejects_whole_batch() {
-        for event in [
-            Value::Map(vec![
-                ("type".into(), "AllBlocksCleared".into()),
-                ("medium".into(), "GPU".into()),
-            ]),
-            Value::Map(vec![
-                ("type".into(), "BlockRemoved".into()),
-                ("medium".into(), "GPU".into()),
-            ]),
-            Value::Map(vec![
-                ("type".into(), "AllBlocksCleared".into()),
-                ("type".into(), "AllBlocksCleared".into()),
-            ]),
+    fn unsupported_event_fields_report_smallest_key() {
+        for (kind, template) in [
+            ("BlockStored", stored()),
+            (
+                "BlockRemoved",
+                Value::Map(vec![
+                    ("type".into(), "BlockRemoved".into()),
+                    ("medium".into(), "GPU".into()),
+                    (
+                        "block_hashes".into(),
+                        Value::Array(vec![Value::Binary(vec![7; 32])]),
+                    ),
+                ]),
+            ),
+            (
+                "AllBlocksCleared",
+                Value::Map(vec![("type".into(), "AllBlocksCleared".into())]),
+            ),
         ] {
-            assert!(decode_batch(&encode(vec![stored(), event], 0.into())).is_err());
+            assert!(decode_batch(&encode(vec![template.clone()], 0.into())).is_ok());
+            for (unknown_keys, expected) in [
+                (&["zzzz", "aaaa"][..], "aaaa"),
+                (&["aaaa", "zzzz"][..], "aaaa"),
+                (&["zzzz"][..], "zzzz"),
+            ] {
+                let mut event = template.clone();
+                for key in unknown_keys {
+                    change(&mut event, key, Value::Nil);
+                }
+                assert_eq!(
+                    decode_batch(&encode(vec![stored(), event], 0.into())).unwrap_err(),
+                    format!("unsupported KV event field: {expected}"),
+                    "{kind}: {unknown_keys:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_lifecycle_rejects_whole_batch() {
+        for (event, expected) in [
+            (
+                Value::Map(vec![
+                    ("type".into(), "AllBlocksCleared".into()),
+                    ("medium".into(), "GPU".into()),
+                ]),
+                "unsupported KV event field: medium",
+            ),
+            (
+                Value::Map(vec![
+                    ("type".into(), "BlockRemoved".into()),
+                    ("medium".into(), "GPU".into()),
+                ]),
+                "missing KV event field: block_hashes",
+            ),
+            (
+                Value::Map(vec![
+                    ("type".into(), "AllBlocksCleared".into()),
+                    ("zzzz".into(), Value::Nil),
+                    ("aaaa".into(), Value::Nil),
+                    ("type".into(), "AllBlocksCleared".into()),
+                ]),
+                "duplicate KV event field: type",
+            ),
+        ] {
+            assert_eq!(
+                decode_batch(&encode(vec![stored(), event], 0.into())).unwrap_err(),
+                expected
+            );
         }
         let removed = Value::Map(vec![
             ("type".into(), "BlockRemoved".into()),
