@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert_eq!(&*res[0].target.instance_id, "w0");
         assert_eq!(res[0].tier, StorageTier::Device);
-        assert_eq!(res[0].matched_depth, 1);
+        assert_eq!(res[0].segments, vec![(0, 1)]);
 
         // 2) REMOVE — drop block 100's claim; index empties.
         publish_until_advanced(
