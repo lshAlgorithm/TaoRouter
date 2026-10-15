@@ -108,6 +108,7 @@ mod test_pd_routing {
             policy: PolicyConfig::Random,
             epd: Some(EpdConfig {
                 encoder_urls: vec![format!("{base}/e")],
+                encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             }),
             worker_startup_timeout_secs: 5,
@@ -283,6 +284,7 @@ mod test_pd_routing {
             policy: PolicyConfig::RoundRobin,
             epd: Some(EpdConfig {
                 encoder_urls: vec![format!("{base}/e")],
+                encode_policy: Some(vllm_router_rs::config::EncodePolicy::Random),
                 consumer_zmq_addrs: Default::default(),
             }),
             worker_startup_timeout_secs: 5,
@@ -457,6 +459,7 @@ mod test_pd_routing {
             policy: PolicyConfig::Random,
             epd: Some(EpdConfig {
                 encoder_urls: vec![format!("{base}/e")],
+                encode_policy: None,
                 consumer_zmq_addrs: Default::default(),
             }),
             kv_connector: KvConnector::Nixl,

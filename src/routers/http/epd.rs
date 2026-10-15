@@ -585,6 +585,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let stage = EncoderStage::new(EpdConfig {
             encoder_urls: vec![url],
+            encode_policy: None,
             consumer_zmq_addrs: Default::default(),
         });
         (stage, seen, server)
@@ -687,6 +688,7 @@ mod tests {
         let (url1, seen1, server1) = spawn().await;
         let stage = EncoderStage::new(EpdConfig {
             encoder_urls: vec![url0, url1],
+            encode_policy: None,
             consumer_zmq_addrs: Default::default(),
         });
         let input = json!({
