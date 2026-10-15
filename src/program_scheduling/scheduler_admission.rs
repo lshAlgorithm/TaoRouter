@@ -172,11 +172,7 @@ impl ProgramScheduler {
                 routing_text.as_deref(),
             );
             if self.config.prediction_profile.mode != PredictionMode::Off {
-                let keys = output_length::keys_for_request(
-                    &identity,
-                    estimated_context_tokens,
-                    &self.config.prediction_profile,
-                );
+                let keys = output_length::keys_for_request(&identity);
                 let prediction = state.prediction_profiles.predict_output(
                     &keys,
                     self.config.prediction_profile.output_length_quantile,
@@ -1038,8 +1034,7 @@ mod tests {
                 workflow_profile_id: None,
                 profile_version: None,
                 model_pool: None,
-                agent_role: None,
-                input_bucket: None,
+                profile_role: None,
             };
             state
                 .prediction_profiles

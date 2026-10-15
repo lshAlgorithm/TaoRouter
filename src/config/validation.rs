@@ -210,7 +210,6 @@ impl ConfigValidator {
         }
         if !strictly_increasing_f64(&prediction.return_time_bucket_bounds_seconds)
             || !strictly_increasing_usize(&prediction.output_length_bucket_bounds_tokens)
-            || !strictly_increasing_usize(&prediction.input_length_bucket_bounds_tokens)
         {
             return Err(ConfigError::ValidationFailed {
                 reason:

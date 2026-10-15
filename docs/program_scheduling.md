@@ -249,7 +249,9 @@ TTL, pause ordering, or admission:
   stable workflow identity. Explicit terminal completions contribute
   `no_return`; TTL expiration and process shutdown remain censored.
 - Output-length prediction conditions completion-token histograms on workflow,
-  model pool, agent role, and an input-length bucket.
+  model pool, and profile role. The profile role uses
+  `spawn_reason` (for example `planner`, `explorer`, `engineer`, `reviewer`, or
+  `verifier`) and falls back to `agent_role` when no workflow stage is supplied.
 
 Requests may supply `workflow_profile_id` and `profile_version` inside
 `vllm_xargs.agentic_context`. These values select a compatible offline seed;
@@ -270,7 +272,6 @@ overlay when `prediction_profile.mode` is `shadow`.
     "return_time_horizon_seconds": 5,
     "step_bucket_size": 4,
     "output_length_bucket_bounds_tokens": [32, 64, 128, 256, 512, 1024],
-    "input_length_bucket_bounds_tokens": [1024, 4096, 16384, 65536],
     "output_length_quantile": 0.95,
     "output_length_min_support": 100,
     "output_length_tail_samples": 5,

@@ -157,8 +157,6 @@ pub struct PredictionProfileConfig {
     pub step_bucket_size: u64,
     #[serde(default = "default_output_length_bucket_bounds_tokens")]
     pub output_length_bucket_bounds_tokens: Vec<usize>,
-    #[serde(default = "default_input_length_bucket_bounds_tokens")]
-    pub input_length_bucket_bounds_tokens: Vec<usize>,
     #[serde(default = "default_output_length_quantile")]
     pub output_length_quantile: f64,
     #[serde(default = "default_output_length_min_support")]
@@ -185,7 +183,6 @@ impl Default for PredictionProfileConfig {
             return_time_horizon_seconds: default_return_time_horizon_seconds(),
             step_bucket_size: default_prediction_step_bucket_size(),
             output_length_bucket_bounds_tokens: default_output_length_bucket_bounds_tokens(),
-            input_length_bucket_bounds_tokens: default_input_length_bucket_bounds_tokens(),
             output_length_quantile: default_output_length_quantile(),
             output_length_min_support: default_output_length_min_support(),
             output_length_tail_samples: default_output_length_tail_samples(),
@@ -645,10 +642,6 @@ fn default_prediction_step_bucket_size() -> u64 {
 
 fn default_output_length_bucket_bounds_tokens() -> Vec<usize> {
     vec![32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-}
-
-fn default_input_length_bucket_bounds_tokens() -> Vec<usize> {
-    vec![1024, 4096, 16_384, 65_536]
 }
 
 fn default_output_length_quantile() -> f64 {

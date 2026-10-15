@@ -62,8 +62,8 @@ pub(crate) struct OutputLengthKey {
     pub workflow_profile_id: Option<String>,
     pub profile_version: Option<String>,
     pub model_pool: Option<String>,
-    pub agent_role: Option<String>,
-    pub input_bucket: Option<usize>,
+    #[serde(alias = "agent_role")]
+    pub profile_role: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -480,7 +480,7 @@ impl PredictionProfileStore {
                 continue;
             };
             let support = histogram.effective_support(prior_weight).round() as usize;
-            if support == 0 {
+            if support < required_support {
                 continue;
             }
             let p50 = histogram
@@ -611,9 +611,22 @@ mod tests {
             workflow_profile_id: Some("workflow".into()),
             profile_version: Some("1".into()),
             model_pool: Some("model".into()),
-            agent_role: Some("engineer".into()),
-            input_bucket: Some(1024),
+            profile_role: Some("engineer".into()),
         }
+    }
+
+    #[test]
+    fn legacy_output_profile_agent_role_deserializes_as_profile_role() {
+        let key: OutputLengthKey = serde_json::from_value(serde_json::json!({
+            "workflow_profile_id": "workflow",
+            "profile_version": "1",
+            "model_pool": "model",
+            "agent_role": "engineer",
+            "input_bucket": 1024
+        }))
+        .unwrap();
+
+        assert_eq!(key.profile_role.as_deref(), Some("engineer"));
     }
 
     #[test]
@@ -673,7 +686,7 @@ mod tests {
         store.load_profile(profile).unwrap();
         store.observe_output(std::slice::from_ref(&key), 200);
         let prediction = store
-            .predict_output(&[key], 0.95, 1, 1, 1.0, 4, 10.0)
+            .predict_output(&[key], 0.5, 1, 1, 1.0, 4, 10.0)
             .unwrap();
         assert_eq!(prediction.source, PredictionSource::Blended);
         assert_eq!(prediction.online_support, 1);
@@ -686,13 +699,14 @@ mod tests {
         let key = output_key();
         let mut store = PredictionProfileStore::empty(vec![1.0, 2.0], vec![64, 128, 256], 16, 4);
         store.observe_output(std::slice::from_ref(&key), 80);
+        store.observe_output(std::slice::from_ref(&key), 80);
         let (_, snapshot) = store.snapshot().unwrap();
         let encoded = serde_json::to_string(&snapshot).unwrap();
         let decoded: PredictionProfileFile = serde_json::from_str(&encoded).unwrap();
         let mut restored = PredictionProfileStore::empty(vec![1.0, 2.0], vec![64, 128, 256], 16, 4);
         restored.load_profile(decoded).unwrap();
         let prediction = restored
-            .predict_output(&[key], 0.95, 1, 1, 1.0, 4, 10.0)
+            .predict_output(&[key], 0.5, 1, 1, 1.0, 4, 10.0)
             .unwrap();
         assert_eq!(prediction.source, PredictionSource::Offline);
         assert_eq!(prediction.tokens, 128);
@@ -719,8 +733,7 @@ mod tests {
             workflow_profile_id: None,
             profile_version: None,
             model_pool: None,
-            agent_role: None,
-            input_bucket: None,
+            profile_role: None,
         };
         let mut store = PredictionProfileStore::empty(vec![1.0], vec![64, 128, 256, 512], 16, 20);
         for _ in 0..18 {
@@ -735,6 +748,26 @@ mod tests {
         assert_eq!(prediction.p50, 64);
         assert_eq!(prediction.p95, 256);
         assert_eq!(prediction.p99, 512);
+    }
+
+    #[test]
+    fn sparse_exact_output_profile_backs_off_to_supported_role_profile() {
+        let exact = output_key();
+        let mut role = exact.clone();
+        role.workflow_profile_id = None;
+        role.profile_version = None;
+        let mut store = PredictionProfileStore::empty(vec![1.0], vec![64, 128, 256], 16, 20);
+        store.observe_output(std::slice::from_ref(&exact), 200);
+        for _ in 0..20 {
+            store.observe_output(std::slice::from_ref(&role), 60);
+        }
+
+        let prediction = store
+            .predict_output(&[exact, role], 0.95, 10, 1, 1.0, 20, 10.0)
+            .unwrap();
+
+        assert_eq!(prediction.backoff_level, 1);
+        assert_eq!(prediction.tokens, 64);
     }
 
     #[test]
@@ -753,7 +786,7 @@ mod tests {
         let mut store = PredictionProfileStore::empty(vec![1.0], vec![64], 1, 4);
         let first = output_key();
         let mut second = output_key();
-        second.agent_role = Some("reviewer".into());
+        second.profile_role = Some("reviewer".into());
         store.observe_output(&[first], 10);
         store.observe_output(&[second], 20);
         assert_eq!(store.output_key_count(), 1);
