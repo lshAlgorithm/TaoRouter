@@ -53,6 +53,11 @@ Other request fields, including sampling options, pass through unchanged.
 Text-only and existing embeds inputs do not call the encoders. PD responses,
 including SSE streams, use the existing transparent forwarding path.
 
+The native Rust configuration supports static HTTP encoders with DP=1; Python
+launcher, dynamic discovery, DP>1, IGW, gRPC encoder transport, full
+cancellation, and real GPU performance are separate follow-up work or
+validation environments.
+
 Encoder failures are returned without submitting a partially prepared PD
 request. There is no automatic replay of EPD requests in this prototype.
 Abandoned Mooncake pushes receive best-effort cancellation over their existing
