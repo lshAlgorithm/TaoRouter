@@ -81,41 +81,68 @@ pub(super) fn reconcile_usage(
 
 #[derive(Default)]
 struct FrameScanner {
-    line_bytes: usize,
-    last_was_cr: bool,
+    line_has_bytes: bool,
+    skip_lf: bool,
 }
 
 impl FrameScanner {
-    // Scan only newly received bytes; remember a partial line across chunks.
+    // CR, LF and CRLF all terminate lines. Process CR immediately and remember
+    // to ignore its optional LF, including when it arrives in a later chunk.
     fn frame_end(&mut self, bytes: &[u8]) -> Option<usize> {
         let mut offset = 0;
-        while let Some(newline) = bytes[offset..].iter().position(|byte| *byte == b'\n') {
-            self.line_bytes += newline;
-            if newline > 0 {
-                self.last_was_cr = bytes[offset + newline - 1] == b'\r';
+        while offset < bytes.len() {
+            let byte = bytes[offset];
+            offset += 1;
+            if std::mem::take(&mut self.skip_lf) && byte == b'\n' {
+                continue;
             }
-            let blank = self.line_bytes == 0 || (self.line_bytes == 1 && self.last_was_cr);
-            self.line_bytes = 0;
-            self.last_was_cr = false;
-            offset += newline + 1;
-            if blank {
-                return Some(offset);
+            if byte == b'\r' || byte == b'\n' {
+                let blank = !self.line_has_bytes;
+                self.line_has_bytes = false;
+                self.skip_lf = byte == b'\r';
+                if blank {
+                    // Include an immediately available LF in the same frame.
+                    // A split LF is forwarded separately by the stream wrapper.
+                    if self.skip_lf && bytes.get(offset) == Some(&b'\n') {
+                        self.skip_lf = false;
+                        offset += 1;
+                    }
+                    return Some(offset);
+                }
+            } else {
+                self.line_has_bytes = true;
             }
-        }
-        self.line_bytes += bytes.len() - offset;
-        if offset < bytes.len() {
-            self.last_was_cr = bytes.last() == Some(&b'\r');
         }
         None
     }
 }
 
+/// Split complete frame lines while retaining the original line terminators.
+fn sse_lines(mut bytes: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    std::iter::from_fn(move || {
+        if bytes.is_empty() {
+            return None;
+        }
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == b'\r' || *byte == b'\n')
+            .unwrap_or(bytes.len());
+        let (line, rest) = bytes.split_at(end);
+        let ending_len = if rest.starts_with(b"\r\n") {
+            2
+        } else {
+            usize::from(!rest.is_empty())
+        };
+        let (ending, tail) = rest.split_at(ending_len);
+        bytes = tail;
+        Some((line, ending))
+    })
+}
+
 fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> Bytes {
     let mut data = Vec::new();
     let mut has_data = false;
-    for line in frame.split_inclusive(|byte| *byte == b'\n') {
-        let line = line.strip_suffix(b"\n").unwrap_or(line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+    for (line, _) in sse_lines(frame) {
         if let Some(value) = line.strip_prefix(b"data:") {
             if has_data {
                 data.push(b'\n');
@@ -147,23 +174,22 @@ fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> 
 
     let mut result = Vec::with_capacity(frame.len() + encoded.len());
     let mut wrote_data = false;
-    for line in frame.split_inclusive(|byte| *byte == b'\n') {
-        let content = line.strip_suffix(b"\n").unwrap_or(line);
-        let content = content.strip_suffix(b"\r").unwrap_or(content);
-        if content.starts_with(b"data:") {
+    for (line, ending) in sse_lines(frame) {
+        if line.starts_with(b"data:") {
             if !wrote_data {
                 result.extend_from_slice(b"data: ");
                 result.extend_from_slice(&encoded);
-                if line.ends_with(b"\r\n") {
-                    result.extend_from_slice(b"\r\n");
-                } else if line.ends_with(b"\n") {
-                    result.push(b'\n');
-                }
                 wrote_data = true;
+            } else {
+                // Preserve every line ending. Removing a continuation line can
+                // join a CR and LF that originally ended different lines, hiding
+                // the event's blank line. Empty data adds only JSON whitespace.
+                result.extend_from_slice(b"data:");
             }
         } else {
             result.extend_from_slice(line);
         }
+        result.extend_from_slice(ending);
     }
     Bytes::from(result)
 }
@@ -223,6 +249,22 @@ where
                 return None;
             }
             if !state.pending.is_empty() {
+                if state.buffer.is_empty()
+                    && !state.passthrough
+                    && state.scanner.skip_lf
+                    && state.pending[0] == b'\n'
+                {
+                    // The preceding event ended at a CR in another chunk.
+                    // Preserve its LF without treating it as a new blank line
+                    // or holding it until the next event/EOF.
+                    state.scanner.skip_lf = false;
+                    let suffix = state.pending.split_to(1);
+                    if state.pending.is_empty() {
+                        state.pending = Bytes::new();
+                    }
+                    return Some((Ok(suffix), state));
+                }
+
                 if state.passthrough {
                     let end = state.scanner.frame_end(&state.pending);
                     let consumed = end.unwrap_or(state.pending.len());
@@ -327,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn sse_limit_counts_delimiters_and_accepts_exact_boundary() {
         let limit = MAX_SSE_FRAME_BYTES;
-        for newline in [b"\n".as_slice(), b"\r\n".as_slice()] {
+        for newline in [b"\n".as_slice(), b"\r\n".as_slice(), b"\r".as_slice()] {
             for size in [limit - 1, limit, limit + 1] {
                 let frame = comment_frame(size, newline);
                 for chunk_size in [8191, size] {
@@ -413,18 +455,16 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
-            assert_eq!(output.len(), 4);
-            assert_eq!(output[0].as_ref(), prefix.as_bytes());
-            let json: Value = serde_json::from_slice(&output[1][6..output[1].len() - 2]).unwrap();
+            let output = output.concat();
+            assert!(output.starts_with(prefix.as_bytes()));
+            assert!(output.ends_with(suffix.as_bytes()));
+            let usage = &output[prefix.len()..output.len() - suffix.len()];
+            let json: Value = serde_json::from_slice(&usage[6..usage.len() - 2]).unwrap();
             assert_eq!(
                 json["usage"]["prompt_tokens_details"],
                 json!({"cached_tokens":64,"audio_tokens":2})
             );
             assert_eq!(json["metrics"], json!({"future":"中文🙂"}));
-            assert_eq!(
-                [output[2].as_ref(), output[3].as_ref()].concat(),
-                suffix.as_bytes()
-            );
         }
     }
 
@@ -576,6 +616,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bare_cr_usage_event_is_reconciled_without_waiting_for_more_input() {
+        let frame = Bytes::from_static(b"event: message\rdata: {\"choices\":[],\"usage\":{\"prompt_tokens\":999,\"completion_tokens\":2,\"total_tokens\":1001,\"prompt_tokens_details\":{\"cached_tokens\":99}}}\r\r");
+        let source = stream::iter([Ok::<_, io::Error>(frame)]).chain(stream::pending());
+        let prefill = json!({"usage": {"prompt_tokens": 70}});
+        let output = rewrite_sse_stream(source, Some(4), Some(prefill));
+        futures_util::pin_mut!(output);
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await
+            .expect("a bare-CR delimiter must release the event immediately")
+            .unwrap()
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.starts_with("event: message\rdata: "));
+        assert!(text.ends_with("\r\r"));
+        let payload = text.strip_prefix("event: message\rdata: ").unwrap().trim();
+        let value: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["usage"]["prompt_tokens"], 70);
+        assert_eq!(value["usage"]["total_tokens"], 72);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn mixed_line_endings_reconcile_multiline_data_at_every_chunk_split() {
+        let input = Bytes::from_static(concat!(
+            ": heartbeat\rid: 7\nevent: response.completed\r\n",
+            "data: {\"type\":\"response.completed\",\r",
+            "data: \"response\":{\"usage\":{\"input_tokens\":999,\"output_tokens\":7,\"total_tokens\":1006}}}\r\n",
+            "\ndata: [DONE]\r\r"
+        ).as_bytes());
+        let prefill = json!({"usage": {"input_tokens": 50}});
+        for split in 0..=input.len() {
+            let source = stream::iter([
+                Ok::<_, io::Error>(input.slice(..split)),
+                Ok(input.slice(split..)),
+            ]);
+            let output = rewrite_sse_stream(source, Some(16), Some(prefill.clone()))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .concat();
+            // Retain even mixed original endings: removing a data line must
+            // not accidentally combine a CR and LF into one terminator.
+            let endings = |bytes: &[u8]| {
+                bytes
+                    .iter()
+                    .copied()
+                    .filter(|byte| *byte == b'\r' || *byte == b'\n')
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(endings(&output), endings(&input), "split={split}");
+            let wire = std::str::from_utf8(&output)
+                .unwrap()
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            let events: Vec<_> = wire
+                .split("\n\n")
+                .filter(|event| !event.is_empty())
+                .collect();
+            assert_eq!(events.len(), 2, "split={split}");
+            assert!(events[0].starts_with(": heartbeat\nid: 7\nevent: response.completed\n"));
+            let payload = events[0]
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|value| value.strip_prefix(' ').unwrap_or(value))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let value: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(
+                value["response"]["usage"],
+                json!({"input_tokens": 50, "output_tokens": 7,
+                "total_tokens": 57, "input_tokens_details": {"cached_tokens": 16}})
+            );
+            assert_eq!(events[1], "data: [DONE]");
+        }
+    }
+
+    #[tokio::test]
+    async fn split_crlf_releases_event_at_cr_and_forwards_optional_lf() {
+        let frame = Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}}}\r\n\r");
+        let (finish, ready) = tokio::sync::oneshot::channel::<()>();
+        let source = stream::iter([Ok::<_, io::Error>(frame)]).chain(stream::once(async move {
+            ready.await.unwrap();
+            Ok(Bytes::from_static(b"\ndata: [DONE]\r\n\r\n"))
+        }));
+        let output = rewrite_sse_stream(source, Some(4), None);
+        futures_util::pin_mut!(output);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+            .await
+            .expect("CR must release the event before an optional LF arrives")
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&first)
+            .unwrap()
+            .contains("\"cached_tokens\":4"));
+        assert!(first.ends_with(b"\r\n\r"));
+        finish.send(()).unwrap();
+        assert_eq!(output.next().await.unwrap().unwrap().as_ref(), b"\n");
+        assert_eq!(
+            output.next().await.unwrap().unwrap().as_ref(),
+            b"data: [DONE]\r\n\r\n"
+        );
+        assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn nested_responses_multiline_data_and_null_usage_keep_framing() {
         let prefill = json!({"usage": {"input_tokens": 50, "output_tokens": 1}});
         let input = Bytes::from_static(concat!(
@@ -590,19 +735,30 @@ mod tests {
                     .try_collect::<Vec<_>>()
                     .await
                     .unwrap();
-            assert_eq!(output.len(), 4);
-            assert!(output[0].ends_with(b"\"usage\":null}}\r\n\r\n"));
-            assert!(output[1].starts_with(b"id: 7\r\nevent: response.completed\r\ndata: "));
-            let text = std::str::from_utf8(&output[1]).unwrap();
-            let payload = text.split("data: ").nth(1).unwrap().trim();
-            let json: Value = serde_json::from_str(payload).unwrap();
+            let output = output.concat();
+            let wire = std::str::from_utf8(&output).unwrap();
+            let normalized = wire.replace("\r\n", "\n").replace('\r', "\n");
+            let frames: Vec<_> = normalized
+                .split("\n\n")
+                .filter(|frame| !frame.is_empty())
+                .collect();
+            assert_eq!(frames.len(), 4);
+            assert!(frames[0].ends_with("\"usage\":null}}"));
+            assert!(frames[1].starts_with("id: 7\nevent: response.completed\ndata: "));
+            let payload = frames[1]
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|value| value.strip_prefix(' ').unwrap_or(value))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let json: Value = serde_json::from_str(&payload).unwrap();
             assert!(json.get("usage").is_none());
             assert_eq!(
                 json["response"]["usage"],
                 json!({"input_tokens": 50, "output_tokens": 7, "total_tokens": 57, "input_tokens_details": {"cached_tokens": 16}})
             );
-            assert_eq!(output[2].as_ref(), b": heartbeat\n\n");
-            assert_eq!(output[3].as_ref(), b"data: [DONE]\n\n");
+            assert_eq!(frames[2], ": heartbeat");
+            assert_eq!(frames[3], "data: [DONE]");
         }
     }
 
