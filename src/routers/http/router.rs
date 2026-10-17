@@ -132,6 +132,32 @@ fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) ->
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+struct WorkerLoadGuard(Option<Arc<dyn Worker>>);
+
+impl WorkerLoadGuard {
+    fn acquire(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self(Some(worker))
+    }
+
+    fn hold_until_body_done(mut self, response: Response) -> Response {
+        match self.0.take() {
+            Some(worker) => hold_load_until_body_done(response, worker),
+            None => response,
+        }
+    }
+}
+
+impl Drop for WorkerLoadGuard {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+    }
+}
+
 struct TypedDispatch<'a> {
     headers: Option<&'a HeaderMap>,
     route: &'a str,
@@ -2512,11 +2538,8 @@ impl RouterTrait for Router {
 
         // Match the typed path's load accounting so cache-aware imbalance
         // detection also sees transparent (EPD) traffic.
-        let load_tracked = policy.name() == "cache_aware" || program_completion.is_some();
-        if load_tracked {
-            worker.increment_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
-        }
+        let load_guard = (policy.name() == "cache_aware" || program_completion.is_some())
+            .then(|| WorkerLoadGuard::acquire(worker.clone()));
 
         let (body, mut transfers) = if let Some(epd) = &self.epd {
             if *method == Method::POST && path == "/v1/chat/completions" {
@@ -2533,10 +2556,6 @@ impl RouterTrait for Router {
                     Ok(value) => value,
                     Err(error) => {
                         RouterMetrics::record_request_error(path, "encoder_error");
-                        if load_tracked {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        }
                         return error.into_response();
                     }
                 }
@@ -2558,10 +2577,6 @@ impl RouterTrait for Router {
             Method::PATCH => self.client.patch(&url),
             Method::HEAD => self.client.head(&url),
             _ => {
-                if load_tracked {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                }
                 RouterMetrics::record_request_error(path, "unsupported_method");
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
@@ -2760,10 +2775,9 @@ impl RouterTrait for Router {
         } else {
             RouterMetrics::record_request_error(path, "backend_error");
         }
-        if load_tracked {
-            hold_load_until_body_done(response, worker)
-        } else {
-            response
+        match load_guard {
+            Some(guard) => guard.hold_until_body_done(response),
+            None => response,
         }
     }
 }
@@ -3522,5 +3536,95 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+
+    async fn transparent_load_router(
+        app: axum::Router,
+        policy: crate::config::types::PolicyConfig,
+    ) -> (Router, Arc<dyn Worker>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{addr}"),
+            WorkerType::Regular,
+        )));
+        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
+        let worker = router.worker_registry.get_all()[0].clone();
+        (router, worker)
+    }
+
+    fn cache_aware_policy() -> crate::config::types::PolicyConfig {
+        crate::config::types::PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 8,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        }
+    }
+
+    fn messages_body() -> serde_json::Value {
+        serde_json::json!({"model": "m", "stream": true, "messages": []})
+    }
+
+    async fn assert_transparent_load(policy: crate::config::types::PolicyConfig, tracked: bool) {
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            }),
+        );
+        let (router, worker) = transparent_load_router(app, policy).await;
+        let in_flight = usize::from(tracked);
+
+        let response = router
+            .route_transparent(None, "/v1/messages", &Method::POST, messages_body())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.load(), in_flight);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(worker.load(), 0);
+
+        let response = router
+            .route_transparent(None, "/v1/messages", &Method::POST, messages_body())
+            .await;
+        assert_eq!(worker.load(), in_flight);
+        drop(response);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_tracks_load_for_cache_aware() {
+        assert_transparent_load(cache_aware_policy(), true).await;
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_skips_load_for_other_policies() {
+        assert_transparent_load(crate::config::types::PolicyConfig::RoundRobin, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_route_transparent_releases_load_when_cancelled_before_headers() {
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(std::future::pending::<&'static str>),
+        );
+        let (router, worker) = transparent_load_router(app, cache_aware_policy()).await;
+
+        let request =
+            router.route_transparent(None, "/v1/messages", &Method::POST, messages_body());
+        tokio::select! {
+            _ = request => panic!("backend never sends headers"),
+            _ = async {
+                while worker.load() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            } => {}
+        }
+        assert_eq!(worker.load(), 0);
     }
 }
