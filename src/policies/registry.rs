@@ -6,7 +6,8 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy, SessionLeastLoadConfig,
+    SessionLeastLoadPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -173,6 +174,7 @@ impl PolicyRegistry {
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "rendezvous_hash" => Arc::new(RendezvousHashPolicy::new()),
+            "session_least_load" => Arc::new(SessionLeastLoadPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
                 Arc::clone(&self.default_policy)
@@ -204,6 +206,15 @@ impl PolicyRegistry {
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::SessionLeastLoad {
+                req_equiv,
+                session_ttl_secs,
+            } => Arc::new(SessionLeastLoadPolicy::with_config(
+                SessionLeastLoadConfig {
+                    req_equiv: *req_equiv,
+                    session_ttl_secs: *session_ttl_secs,
+                },
+            )),
         }
     }
 

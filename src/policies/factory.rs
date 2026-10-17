@@ -2,7 +2,8 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LoadBalancingPolicy,
-    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy, SessionLeastLoadConfig,
+    SessionLeastLoadPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -39,6 +40,15 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
+            PolicyConfig::SessionLeastLoad {
+                req_equiv,
+                session_ttl_secs,
+            } => Arc::new(SessionLeastLoadPolicy::with_config(
+                SessionLeastLoadConfig {
+                    req_equiv: *req_equiv,
+                    session_ttl_secs: *session_ttl_secs,
+                },
+            )),
         }
     }
 
@@ -51,6 +61,9 @@ impl PolicyFactory {
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "consistent_hash" | "consistenthash" => Some(Arc::new(ConsistentHashPolicy::new())),
             "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
+            "session_least_load" | "sessionleastload" => {
+                Some(Arc::new(SessionLeastLoadPolicy::new()))
+            }
             _ => None,
         }
     }
@@ -94,6 +107,13 @@ mod tests {
         // Test RendezvousHash
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RendezvousHash);
         assert_eq!(policy.name(), "rendezvous_hash");
+
+        // Test SessionLeastLoad
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::SessionLeastLoad {
+            req_equiv: 512,
+            session_ttl_secs: 14400,
+        });
+        assert_eq!(policy.name(), "session_least_load");
     }
 
     #[test]
@@ -110,6 +130,28 @@ mod tests {
         assert!(PolicyFactory::create_by_name("ConsistentHash").is_some());
         assert!(PolicyFactory::create_by_name("rendezvous_hash").is_some());
         assert!(PolicyFactory::create_by_name("RendezvousHash").is_some());
+        assert!(PolicyFactory::create_by_name("session_least_load").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
+    }
+
+    #[test]
+    fn test_only_session_least_load_needs_prompt_text() {
+        for name in [
+            "random",
+            "round_robin",
+            "power_of_two",
+            "cache_aware",
+            "consistent_hash",
+            "rendezvous_hash",
+            "session_least_load",
+        ] {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            assert_eq!(
+                policy.needs_prompt_text(),
+                name == "session_least_load",
+                "{}",
+                name
+            );
+        }
     }
 }

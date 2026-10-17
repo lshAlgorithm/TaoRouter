@@ -688,6 +688,14 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+
+    #[serde(rename = "session_least_load")]
+    SessionLeastLoad {
+        /// Tokens one in-flight request weighs in a worker's load (ATOM_DP_LB_REQ_EQUIV)
+        req_equiv: u64,
+        /// Seconds an idle session keeps its owner
+        session_ttl_secs: u64,
+    },
 }
 
 impl PolicyConfig {
@@ -699,6 +707,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
+            PolicyConfig::SessionLeastLoad { .. } => "session_least_load",
         }
     }
 }

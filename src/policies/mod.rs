@@ -17,6 +17,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+mod session_least_load;
 
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
@@ -27,10 +28,23 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use session_least_load::{SessionLeastLoadConfig, SessionLeastLoadPolicy};
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
+
+/// One request's in-flight load, charged to a worker by `select_worker_tracked`
+///
+/// The router calls `prefill_done` when a successful response returns output (on every chunk of a
+/// streamed body) and drops the guard when the request ends (finished, failed or aborted by the
+/// client); dropping it releases what is left.
+pub trait RequestLoadGuard: Send {
+    /// The worker returned output, so the prompt is prefilled. Must be idempotent.
+    fn prefill_done(&mut self);
+}
+
+pub type LoadGuard = Box<dyn RequestLoadGuard>;
 
 /// Core trait for load balancing policies
 ///
@@ -60,6 +74,20 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
+
+    /// Select a worker and charge the request to it, for policies that track in-flight load
+    ///
+    /// Returns the worker index and, for a load-tracking policy, the guard that holds the charge.
+    /// Default: `select_worker_with_headers` without a guard.
+    fn select_worker_tracked(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, Option<LoadGuard>)> {
+        self.select_worker_with_headers(workers, request_text, headers)
+            .map(|idx| (idx, None))
+    }
 
     /// Select a pair of workers (prefill and decode) for PD routing
     ///
@@ -108,6 +136,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Check if this policy needs HTTP headers for routing decisions
     fn needs_headers(&self) -> bool {
         false // Default: most policies don't need headers
+    }
+
+    /// Check if this policy needs the prompt text of a typed request (for a chat completion the
+    /// conversation text Program scheduling uses) instead of `extract_text_for_routing`
+    fn needs_prompt_text(&self) -> bool {
+        false // Default: policies route on extract_text_for_routing
     }
 
     /// Update worker load information

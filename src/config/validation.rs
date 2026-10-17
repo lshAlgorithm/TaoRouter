@@ -412,6 +412,17 @@ impl ConfigValidator {
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
             }
+            PolicyConfig::SessionLeastLoad {
+                session_ttl_secs, ..
+            } => {
+                if *session_ttl_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "session_ttl_secs".to_string(),
+                        value: session_ttl_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -614,6 +625,30 @@ impl ConfigValidator {
                 reason: "Program scheduling currently requires regular HTTP routing mode"
                     .to_string(),
             });
+        }
+        // session_least_load charges load only through the regular HTTP router; the PD routers
+        // select without its load guard.
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &config.mode
+        {
+            let policies = [
+                Some(&config.policy),
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+            ];
+            if policies
+                .into_iter()
+                .flatten()
+                .any(|p| matches!(p, PolicyConfig::SessionLeastLoad { .. }))
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "session_least_load policy requires regular HTTP routing mode"
+                        .to_string(),
+                });
+            }
         }
         // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
@@ -1159,6 +1194,46 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_validate_pd_mode_rejects_session_least_load() {
+        let session_least_load = PolicyConfig::SessionLeastLoad {
+            req_equiv: 512,
+            session_ttl_secs: 14400,
+        };
+        let pd_mode = |decode_policy: Option<PolicyConfig>| RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+            decode_urls: vec!["http://decode1:8000".to_string()],
+            prefill_policy: None,
+            decode_policy,
+            discovery_address: None,
+        };
+
+        let rejected = |config: &RouterConfig| {
+            ConfigValidator::validate(config)
+                .is_err_and(|e| e.to_string().contains("session_least_load"))
+        };
+        assert!(rejected(&RouterConfig::new(
+            pd_mode(None),
+            session_least_load.clone()
+        )));
+        assert!(rejected(&RouterConfig::new(
+            pd_mode(Some(session_least_load.clone())),
+            PolicyConfig::Random
+        )));
+        assert!(
+            ConfigValidator::validate(&RouterConfig::new(pd_mode(None), PolicyConfig::Random))
+                .is_ok()
+        );
+
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            session_least_load,
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

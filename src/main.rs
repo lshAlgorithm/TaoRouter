@@ -120,7 +120,7 @@ struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "session_least_load"])]
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
@@ -181,6 +181,15 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
+
+    /// session_least_load: tokens one in-flight request weighs in a worker's load
+    /// (load = outstanding prefill tokens + this x in-flight requests; ATOM_DP_LB_REQ_EQUIV)
+    #[arg(long, default_value_t = 512)]
+    session_least_load_req_equiv: u64,
+
+    /// session_least_load: seconds an idle session keeps its owner worker
+    #[arg(long, default_value_t = 14400)]
+    session_least_load_ttl_secs: u64,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -415,6 +424,10 @@ impl CliArgs {
                 virtual_nodes: 160, // Default value
             },
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
+            "session_least_load" => PolicyConfig::SessionLeastLoad {
+                req_equiv: self.session_least_load_req_equiv,
+                session_ttl_secs: self.session_least_load_ttl_secs,
+            },
             _ => PolicyConfig::RoundRobin, // Fallback
         }
     }
