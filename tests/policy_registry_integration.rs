@@ -40,6 +40,8 @@ async fn test_policy_registry_with_router_manager() {
 
     let _worker1_config = WorkerConfigRequest {
         url: "http://worker1:8000".to_string(),
+        dp_rank: None,
+        dp_size: None,
         model_id: Some("llama-3".to_string()),
         worker_type: None,
         priority: None,
@@ -61,6 +63,8 @@ async fn test_policy_registry_with_router_manager() {
 
     let _worker2_config = WorkerConfigRequest {
         url: "http://worker2:8000".to_string(),
+        dp_rank: None,
+        dp_size: None,
         model_id: Some("llama-3".to_string()),
         worker_type: None,
         priority: None,
@@ -77,6 +81,8 @@ async fn test_policy_registry_with_router_manager() {
 
     let _worker3_config = WorkerConfigRequest {
         url: "http://worker3:8000".to_string(),
+        dp_rank: None,
+        dp_size: None,
         model_id: Some("gpt-4".to_string()),
         worker_type: None,
         priority: None,

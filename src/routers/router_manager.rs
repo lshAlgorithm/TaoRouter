@@ -5,7 +5,9 @@
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
 use crate::config::RouterConfig;
-use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
+use crate::core::{
+    BasicWorker, CircuitBreakerConfig, DPAwareWorker, Worker, WorkerRegistry, WorkerType,
+};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
     InferenceGenerateRequest, RerankRequest, ResponsesRequest,
@@ -23,7 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 /// Router identifier
@@ -61,6 +63,7 @@ pub struct RouterManager {
     /// Configuration
     #[allow(dead_code)] // May be used in future enhancements
     config: RouterConfig,
+    worker_mutations: Mutex<()>,
 }
 
 impl RouterManager {
@@ -78,6 +81,7 @@ impl RouterManager {
             default_router: Arc::new(std::sync::RwLock::new(None)),
             client,
             config,
+            worker_mutations: Mutex::new(()),
         }
     }
 
@@ -152,8 +156,15 @@ impl RouterManager {
     /// Add a worker to the registry
     pub async fn add_worker(
         &self,
-        config: WorkerConfigRequest,
+        mut config: WorkerConfigRequest,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+        config.validate_dp().map_err(|error| WorkerErrorResponse {
+            error,
+            code: "INVALID_DP_CONFIG".into(),
+        })?;
+        if config.dp_rank.is_some() {
+            config.url = config.url.trim_end_matches('/').to_owned();
+        }
         // Build labels from configuration
         let mut labels = config.labels.clone();
 
@@ -190,27 +201,66 @@ impl RouterManager {
             labels.insert("cost".to_string(), cost.to_string());
         }
 
-        let worker = match config.worker_type.as_deref() {
-            Some("prefill") => WorkerFactory::create_prefill_with_labels(
-                config.url.clone(),
-                config.bootstrap_port,
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            Some("decode") => WorkerFactory::create_decode_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
-            _ => WorkerFactory::create_regular_with_labels(
-                config.url.clone(),
-                labels.clone(),
-                CircuitBreakerConfig::default(),
-            ),
+        let worker_type = match config.worker_type.as_deref() {
+            Some("prefill") => WorkerType::Prefill {
+                bootstrap_port: config.bootstrap_port,
+            },
+            Some("decode") => WorkerType::Decode,
+            _ => WorkerType::Regular,
         };
-
-        // Register worker
-        let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+        let worker_arc: Arc<dyn Worker> =
+            if let (Some(rank), Some(size)) = (config.dp_rank, config.dp_size) {
+                Arc::new(
+                    DPAwareWorker::new(config.url.clone(), rank, size, worker_type)
+                        .with_labels(labels.clone())
+                        .with_circuit_breaker_config(CircuitBreakerConfig::default()),
+                )
+            } else {
+                Arc::new(
+                    BasicWorker::new(config.url.clone(), worker_type)
+                        .with_labels(labels.clone())
+                        .with_circuit_breaker_config(CircuitBreakerConfig::default()),
+                )
+            };
+        let _guard = self
+            .worker_mutations
+            .lock()
+            .expect("Worker mutation lock poisoned");
+        for (id, existing) in self.worker_registry.get_all_with_ids() {
+            if existing.url() != worker_arc.url()
+                && existing.base_url().trim_end_matches('/')
+                    != worker_arc.base_url().trim_end_matches('/')
+            {
+                continue;
+            }
+            if !existing.is_dp_aware() && !worker_arc.is_dp_aware() {
+                continue;
+            }
+            if existing.dp_size() != worker_arc.dp_size()
+                || existing.worker_type() != worker_arc.worker_type()
+                || existing.model_id() != worker_arc.model_id()
+            {
+                return Err(WorkerErrorResponse {
+                    error:
+                        "Workers sharing a DP endpoint must have the same model, type and dp_size"
+                            .into(),
+                    code: "WORKER_CONFLICT".into(),
+                });
+            }
+            if existing.url() == worker_arc.url() {
+                if existing.metadata().labels != worker_arc.metadata().labels {
+                    return Err(WorkerErrorResponse {
+                        error: "DP worker is already registered with different metadata".into(),
+                        code: "WORKER_CONFLICT".into(),
+                    });
+                }
+                return Ok(WorkerApiResponse {
+                    success: true,
+                    message: "Worker already registered".into(),
+                    worker: Some(self.worker_to_info(id.as_str(), &existing)),
+                });
+            }
+        }
         let worker_id = self.worker_registry.register(worker_arc.clone());
 
         // Notify PolicyRegistry about the new worker
@@ -252,6 +302,10 @@ impl RouterManager {
         &self,
         url: &str,
     ) -> Result<WorkerApiResponse, WorkerErrorResponse> {
+        let _guard = self
+            .worker_mutations
+            .lock()
+            .expect("Worker mutation lock poisoned");
         // Get worker to extract model_id before removing
         let model_id = self
             .worker_registry
@@ -347,6 +401,9 @@ impl RouterManager {
         WorkerInfo {
             id: id.to_string(),
             url: worker.url().to_string(),
+            base_url: worker.is_dp_aware().then(|| worker.base_url().to_owned()),
+            dp_rank: worker.dp_rank(),
+            dp_size: worker.dp_size(),
             model_id: worker.model_id().to_string(),
             priority: worker.priority(),
             cost: worker.cost(),
@@ -453,6 +510,8 @@ impl WorkerManagement for RouterManager {
         // Create a basic worker config request
         let config = WorkerConfigRequest {
             url: worker_url.to_string(),
+            dp_rank: None,
+            dp_size: None,
             model_id: None,
             worker_type: None,
             priority: None,
