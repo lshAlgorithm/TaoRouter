@@ -1,8 +1,15 @@
 use std::sync::Arc;
 
 use vllm_router_rs::kv_index::{
-    ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier,
+    ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TierMatch,
 };
+
+fn prefix_depth(hit: &TierMatch) -> u32 {
+    match hit.segments.first() {
+        Some((0, end)) => *end,
+        _ => 0,
+    }
+}
 
 #[test]
 fn a_partial_compressed_edge_match_must_not_skip_to_its_child() {
@@ -36,10 +43,7 @@ fn a_partial_compressed_edge_match_must_not_skip_to_its_child() {
         tiers_of_interest: vec![StorageTier::Device],
     });
     assert_eq!(hits.len(), 1);
-    assert_eq!(
-        hits[0].matched_depth, 1,
-        "y was not matched; z is not contiguous"
-    );
+    assert_eq!(hits[0].segments, vec![(0, 1)], "y was not matched");
 }
 
 fn worker(source: &str, dp_rank: u32) -> ResidencyOwner {
@@ -133,7 +137,7 @@ fn interior_parent_branch_preserves_prefix_boundaries() {
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
-        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+        assert_eq!(prefix_depth(&hits[0]), expected_depth, "query {hashes:?}");
     }
 }
 
@@ -170,7 +174,8 @@ fn middle_and_tail_engine_parents_keep_their_exact_prefix() {
             let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
             assert_eq!(hits.len(), 1, "parent {parent}, query {hashes:?}");
             assert_eq!(
-                hits[0].matched_depth, expected_depth,
+                prefix_depth(&hits[0]),
+                expected_depth,
                 "parent {parent}, query {hashes:?}"
             );
         }
@@ -179,7 +184,8 @@ fn middle_and_tail_engine_parents_keep_their_exact_prefix() {
             let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
             assert_eq!(hits.len(), 1, "parent {parent}, query {hashes:?}");
             assert_eq!(
-                hits[0].matched_depth, 3,
+                prefix_depth(&hits[0]),
+                3,
                 "parent {parent}, query {hashes:?}"
             );
         }
@@ -228,7 +234,7 @@ fn existing_interior_branch_is_idempotent_and_extends_contiguously() {
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
-        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+        assert_eq!(prefix_depth(&hits[0]), expected_depth, "query {hashes:?}");
     }
 }
 
@@ -270,7 +276,7 @@ fn repeated_local_hashes_have_distinct_interior_engine_parents() {
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
-        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+        assert_eq!(prefix_depth(&hits[0]), expected_depth, "query {hashes:?}");
     }
 }
 
@@ -327,7 +333,7 @@ fn interior_parent_splits_preserve_children_and_relocate_suffix_anchors() {
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
-        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+        assert_eq!(prefix_depth(&hits[0]), expected_depth, "query {hashes:?}");
     }
 }
 
@@ -399,18 +405,19 @@ fn interior_parent_split_preserves_isolated_owner_rank_tier_and_group_claims() {
                 other_depth
             };
             assert_eq!(
-                hit.matched_depth, expected_depth,
+                prefix_depth(hit),
+                expected_depth,
                 "{owner:?}/{tier:?}: {hashes:?}"
             );
         }
     }
     let host_hits = index.find_matches(&query(0, &["x", "w"], &[StorageTier::HostPinned]));
     assert_eq!(host_hits.len(), 1);
-    assert_eq!(host_hits[0].matched_depth, 1);
+    assert_eq!(prefix_depth(&host_hits[0]), 1);
     let group_hits = index.find_matches(&query(1, &["x", "w"], &[StorageTier::Device]));
     assert_eq!(group_hits.len(), 1);
     assert_eq!(group_hits[0].target, other_worker.target());
-    assert_eq!(group_hits[0].matched_depth, 2);
+    assert_eq!(prefix_depth(&group_hits[0]), 2);
     assert!(index
         .find_matches(&query(2, &["x", "w"], &tiers))
         .is_empty());
@@ -450,42 +457,37 @@ fn remove_and_clear_after_an_interior_split_preserve_other_claims() {
         &[("sx", "x"), ("sw", "w")],
     );
     index.remove(0, &original, StorageTier::Device, &[Arc::from("sy")]);
-    for (hashes, original_depth, rank_depth) in
-        [(vec!["x", "y", "z"], 1, 3), (vec!["x", "w"], 2, 2)]
-    {
+    for (hashes, original_segments, rank_segments) in [
+        (vec!["x", "y", "z"], vec![(0, 1), (2, 3)], vec![(0, 3)]),
+        (vec!["x", "w"], vec![(0, 2)], vec![(0, 2)]),
+    ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 2, "query {hashes:?}");
-        for (owner, depth) in [(&original, original_depth), (&other_rank, rank_depth)] {
+        for (owner, segments) in [(&original, original_segments), (&other_rank, rank_segments)] {
             let hit = hits
                 .iter()
                 .find(|hit| hit.target == owner.target())
                 .expect("both ranks hold x");
-            assert_eq!(hit.matched_depth, depth, "{owner:?}: {hashes:?}");
+            assert_eq!(hit.segments, segments, "{owner:?}: {hashes:?}");
         }
     }
     index.remove(0, &original, StorageTier::Device, &[Arc::from("sw")]);
     let branch_hits = index.find_matches(&query(0, &["x", "w"], &[StorageTier::Device]));
     assert_eq!(branch_hits.len(), 2);
-    assert_eq!(
-        branch_hits
-            .iter()
-            .find(|hit| hit.target == original.target())
-            .unwrap()
-            .matched_depth,
-        1
-    );
-    assert_eq!(
-        branch_hits
-            .iter()
-            .find(|hit| hit.target == other_rank.target())
-            .unwrap()
-            .matched_depth,
-        2
-    );
+    let original_branch = branch_hits
+        .iter()
+        .find(|hit| hit.target == original.target())
+        .unwrap();
+    assert_eq!(original_branch.segments, vec![(0, 1)]);
+    let other_rank_branch = branch_hits
+        .iter()
+        .find(|hit| hit.target == other_rank.target())
+        .unwrap();
+    assert_eq!(other_rank_branch.segments, vec![(0, 2)]);
     for hashes in [vec!["x", "w"], vec!["x", "y", "z"]] {
         let host_hits = index.find_matches(&query(0, &hashes, &[StorageTier::HostPinned]));
         assert_eq!(host_hits.len(), 1);
-        assert_eq!(host_hits[0].matched_depth as usize, hashes.len());
+        assert_eq!(prefix_depth(&host_hits[0]) as usize, hashes.len());
     }
     index.clear(&original, ClearScope::Worker);
     for hashes in [vec!["x", "w"], vec!["x", "y", "z"]] {
@@ -508,7 +510,7 @@ fn remove_and_clear_after_an_interior_split_preserve_other_claims() {
                 .find(|hit| hit.target == owner.target() && hit.tier == tier)
                 .expect("rank and cache-owner claims survive worker clear");
             assert_eq!(
-                hit.matched_depth as usize,
+                prefix_depth(hit) as usize,
                 hashes.len(),
                 "{owner:?}/{tier:?}: {hashes:?}"
             );
@@ -524,7 +526,7 @@ fn remove_and_clear_after_an_interior_split_preserve_other_claims() {
     let remaining = index.find_matches(&query(0, &["x", "w"], &[StorageTier::Device]));
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].target, other_rank.target());
-    assert_eq!(remaining[0].matched_depth, 2);
+    assert_eq!(prefix_depth(&remaining[0]), 2);
 }
 
 #[test]
@@ -538,7 +540,7 @@ fn compressed_prefix_query_boundaries() {
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
-        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+        assert_eq!(prefix_depth(&hits[0]), expected_depth, "query {hashes:?}");
     }
     for hashes in [vec![], vec!["missing"], vec!["y", "z"]] {
         assert!(
@@ -586,7 +588,7 @@ fn a_deeper_compressed_edge_mismatch_keeps_only_the_contiguous_prefix() {
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
-        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+        assert_eq!(prefix_depth(&hits[0]), expected_depth, "query {hashes:?}");
     }
 }
 
@@ -617,7 +619,7 @@ fn repeated_local_hashes_do_not_skip_distinct_sequence_positions() {
     ] {
         let hits = index.find_matches(&query(0, &hashes, &[StorageTier::Device]));
         assert_eq!(hits.len(), 1, "query {hashes:?}");
-        assert_eq!(hits[0].matched_depth, expected_depth, "query {hashes:?}");
+        assert_eq!(prefix_depth(&hits[0]), expected_depth, "query {hashes:?}");
     }
 }
 
@@ -647,7 +649,7 @@ fn a_real_alternate_branch_remains_matchable_by_its_owner() {
                 .iter()
                 .find(|hit| hit.target.instance_id.as_ref() == source)
                 .expect("each owner holds x");
-            assert_eq!(hit.matched_depth, expected_depth, "{source}: {hashes:?}");
+            assert_eq!(prefix_depth(hit), expected_depth, "{source}: {hashes:?}");
         }
     }
 }
@@ -681,26 +683,26 @@ fn target_rank_tier_and_group_claims_do_not_fill_each_others_gaps() {
         &[StorageTier::Device, StorageTier::HostPinned],
     ));
     assert_eq!(hits.len(), 4);
-    for (owner, tier, expected_depth) in [
-        (&original, StorageTier::Device, 3),
-        (&other_worker, StorageTier::Device, 1),
-        (&other_rank, StorageTier::Device, 1),
-        (&original, StorageTier::HostPinned, 1),
+    for (owner, tier, expected_segments) in [
+        (&original, StorageTier::Device, vec![(0, 3)]),
+        (&other_worker, StorageTier::Device, vec![(0, 1), (2, 3)]),
+        (&other_rank, StorageTier::Device, vec![(0, 1), (2, 3)]),
+        (&original, StorageTier::HostPinned, vec![(0, 1), (2, 3)]),
     ] {
         let hit = hits
             .iter()
             .find(|hit| hit.target == owner.target() && hit.tier == tier)
             .expect("each target/tier holds x");
-        assert_eq!(hit.matched_depth, expected_depth);
+        assert_eq!(hit.segments, expected_segments);
     }
     let host_hits = index.find_matches(&query(0, &["x", "y", "z"], &[StorageTier::HostPinned]));
     assert_eq!(host_hits.len(), 1);
     assert_eq!(host_hits[0].tier, StorageTier::HostPinned);
-    assert_eq!(host_hits[0].matched_depth, 1);
+    assert_eq!(host_hits[0].segments, vec![(0, 1), (2, 3)]);
     let group_hits = index.find_matches(&query(1, &["x", "y", "z"], &[StorageTier::Device]));
     assert_eq!(group_hits.len(), 1);
     assert_eq!(group_hits[0].target, other_worker.target());
-    assert_eq!(group_hits[0].matched_depth, 3);
+    assert_eq!(group_hits[0].segments, vec![(0, 3)]);
     assert!(index
         .find_matches(&query(2, &["x", "y", "z"], &[StorageTier::Device]))
         .is_empty());
@@ -765,7 +767,8 @@ fn equivalent_long_short_and_mixed_edges_have_the_same_prefix_semantics() {
             } else {
                 assert_eq!(hits.len(), 1, "shape {shape}, query {hashes:?}");
                 assert_eq!(
-                    hits[0].matched_depth, expected_depth,
+                    prefix_depth(&hits[0]),
+                    expected_depth,
                     "shape {shape}, query {hashes:?}"
                 );
             }
