@@ -16,11 +16,16 @@ pub struct ClientRequestOptions<'a> {
 pub struct PreparedClientRequest {
     request: reqwest::RequestBuilder,
     span: Span,
+    safe_pd_errors: bool,
 }
 
 impl PreparedClientRequest {
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
-        let Self { request, span } = self;
+        let Self {
+            request,
+            span,
+            safe_pd_errors,
+        } = self;
 
         let response = if span.is_none() {
             request.send().await
@@ -46,7 +51,11 @@ impl PreparedClientRequest {
             }
             Err(error) => {
                 if !span.is_disabled() {
-                    let message = error.to_string();
+                    let message = if safe_pd_errors {
+                        pd_transport_description(&error).to_owned()
+                    } else {
+                        error.to_string()
+                    };
                     span.record("error", message.as_str());
                     span.set_status(opentelemetry::trace::Status::error(message));
                 }
@@ -100,7 +109,11 @@ pub fn prepare_client_request(
         Span::none()
     };
 
-    PreparedClientRequest { request, span }
+    PreparedClientRequest {
+        request,
+        span,
+        safe_pd_errors: matches!(options.request_phase, Some("prefill" | "decode")),
+    }
 }
 
 pub async fn send_client_request(
@@ -148,5 +161,17 @@ fn record_server_address(span: &Span, url: &str) {
 
     if let Some(port) = parsed.port_or_known_default() {
         span.record("server.port", port);
+    }
+}
+
+fn pd_transport_description(error: &reqwest::Error) -> &'static str {
+    if error.is_builder() {
+        "P/D request construction failed"
+    } else if error.is_timeout() {
+        "P/D upstream timeout"
+    } else if error.is_connect() {
+        "P/D upstream connection failed"
+    } else {
+        "P/D upstream transport failed"
     }
 }
