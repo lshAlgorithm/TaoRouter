@@ -69,6 +69,10 @@ pub enum KVEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockStored {
+    /// Opaque, lossless MessagePack values. Structural acceptance does not
+    /// establish extension semantics or device eligibility for consumers.
+    #[serde(default)]
+    pub extra_keys: Option<Vec<rmpv::Value>>,
     pub block_hashes: Vec<ExternalBlockHash>,
     pub parent_block_hash: Option<ExternalBlockHash>,
     pub token_ids: Vec<u32>,
@@ -155,6 +159,7 @@ mod tests {
     #[test]
     fn block_stored_with_int_hashes_round_trips() {
         let ev = KVEvent::BlockStored(BlockStored {
+            extra_keys: None,
             block_hashes: vec![ExternalBlockHash::Int(42), ExternalBlockHash::Int(43)],
             parent_block_hash: Some(ExternalBlockHash::Int(42)),
             token_ids: vec![1, 2, 3, 4],
@@ -184,6 +189,7 @@ mod tests {
     #[test]
     fn block_stored_with_byte_hashes_round_trips() {
         let ev = KVEvent::BlockStored(BlockStored {
+            extra_keys: None,
             block_hashes: vec![ExternalBlockHash::Bytes(vec![0u8; 32])],
             parent_block_hash: None,
             token_ids: vec![5],

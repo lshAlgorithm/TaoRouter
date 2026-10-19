@@ -1,8 +1,15 @@
 use std::sync::Arc;
 
 use vllm_router_rs::kv_index::{
-    ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier,
+    ClearScope, KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TierMatch,
 };
+
+fn prefix_depth(hit: &TierMatch) -> u32 {
+    match hit.segments.first() {
+        Some((0, end)) => *end,
+        _ => 0,
+    }
+}
 
 #[test]
 fn second_owner_sequence_alias_is_removable() {
@@ -88,7 +95,7 @@ fn depth(
         })
         .iter()
         .find(|hit| hit.target == owner.target())
-        .map_or(0, |hit| hit.matched_depth)
+        .map_or(0, prefix_depth)
 }
 
 #[test]

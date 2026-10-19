@@ -19,7 +19,7 @@ use crate::kv_index::IngestionSignal;
 // ponytail: cache_salt/MM isolation deferred — needs raw msgpack capture of
 // per-block extra_keys tuples (custom newtype or rmpv); add when cost model
 // scores cross-salt collisions. Until then lora_name alone distinguishes adapters.
-fn local_hashes(token_ids: &[u32], block_size: u32, lora_name: Option<&str>) -> Vec<[u8; 32]> {
+pub fn local_hashes(token_ids: &[u32], block_size: u32, lora_name: Option<&str>) -> Vec<[u8; 32]> {
     let bs = block_size as usize;
     if bs == 0 {
         return Vec::new();
@@ -440,6 +440,7 @@ mod tests {
         ownership: Option<&str>,
     ) -> BlockStored {
         BlockStored {
+            extra_keys: None,
             block_hashes,
             parent_block_hash: None,
             token_ids,
@@ -643,6 +644,7 @@ mod tests {
             1,
             1.0,
             &[KVEvent::BlockStored(BlockStored {
+                extra_keys: None,
                 block_hashes: vec![ExternalBlockHash::Int(100)],
                 parent_block_hash: None,
                 token_ids: vec![1, 2, 3, 4],
@@ -664,7 +666,7 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert_eq!(&*res[0].target.instance_id, "w0");
         assert_eq!(res[0].tier, StorageTier::Device);
-        assert_eq!(res[0].matched_depth, 1);
+        assert_eq!(res[0].segments, vec![(0, 1)]);
 
         // 2) REMOVE — drop block 100's claim; index empties.
         publish_until_advanced(
