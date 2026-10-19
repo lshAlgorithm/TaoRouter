@@ -435,6 +435,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         "cache_aware"
     }
 
+    fn needs_cache_routing_key(&self) -> bool {
+        true
+    }
+
     fn needs_request_text(&self) -> bool {
         true // Cache-aware policy needs request text for cache affinity
     }

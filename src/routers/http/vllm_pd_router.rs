@@ -85,10 +85,12 @@ impl PolicyRequestText {
         cache_key: impl FnOnce() -> String,
     ) -> Self {
         let policies = [prefill, decode];
-        let needs_cache = policies.iter().any(|policy| policy.name() == "cache_aware");
+        let needs_cache = policies
+            .iter()
+            .any(|policy| policy.needs_cache_routing_key());
         let needs_legacy = policies
             .iter()
-            .any(|policy| policy.name() != "cache_aware" && policy.needs_request_text());
+            .any(|policy| !policy.needs_cache_routing_key() && policy.needs_request_text());
         Self {
             legacy: needs_legacy.then(legacy_text).flatten(),
             cache: needs_cache.then(cache_key),
@@ -96,7 +98,7 @@ impl PolicyRequestText {
     }
 
     fn for_policy(&self, policy: &dyn LoadBalancingPolicy) -> Option<&str> {
-        if policy.name() == "cache_aware" {
+        if policy.needs_cache_routing_key() {
             self.cache.as_deref()
         } else {
             self.legacy.as_deref()
@@ -3048,7 +3050,7 @@ mod tests {
                 },
             );
             for policy in [prefill, decode] {
-                if policy.name() == "cache_aware" {
+                if policy.needs_cache_routing_key() {
                     assert_eq!(input.for_policy(policy), Some("\0ca:t:raw"));
                 } else if policy.needs_request_text() {
                     assert_eq!(input.for_policy(policy), Some(r#"{"prompt":"raw"}"#));
