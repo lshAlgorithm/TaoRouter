@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
@@ -107,12 +108,18 @@ async fn request(app: &Router, method: &str, path: &str, body: Value) -> (Status
 struct TestWorker {
     url: String,
     ranks: Arc<Mutex<Vec<Option<String>>>>,
+    model_available: Arc<AtomicBool>,
+    model_queries: Arc<AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
 }
 
 impl TestWorker {
     async fn new() -> Self {
         let ranks = Arc::new(Mutex::new(Vec::new()));
+        let model_available = Arc::new(AtomicBool::new(true));
+        let model_queries = Arc::new(AtomicUsize::new(0));
+        let available = model_available.clone();
+        let queries = model_queries.clone();
         let observed = ranks.clone();
         let respond = move |headers: HeaderMap| {
             let observed = observed.clone();
@@ -132,7 +139,19 @@ impl TestWorker {
             .route("/health", get(|| async { StatusCode::OK }))
             .route(
                 "/get_server_info",
-                get(|| async { Json(json!({"model_id": "test"})) }),
+                get(move || {
+                    let available = available.clone();
+                    let queries = queries.clone();
+                    async move {
+                        queries.fetch_add(1, Ordering::SeqCst);
+                        let status = if available.load(Ordering::SeqCst) {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        };
+                        (status, Json(json!({"model_id": "test"})))
+                    }
+                }),
             )
             .route("/v1/chat/completions", post(respond.clone()))
             .route("/v1/responses/{id}", get(respond.clone()))
@@ -140,7 +159,13 @@ impl TestWorker {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Self { url, ranks, server }
+        Self {
+            url,
+            ranks,
+            model_available,
+            model_queries,
+            server,
+        }
     }
 }
 
@@ -539,4 +564,181 @@ async fn consistent_hash_keeps_session_affinity_across_pd_ranks() {
             assert!(turns.iter().all(|rank| rank == &turns[0]));
         }
     }
+}
+
+#[tokio::test]
+async fn regression_legacy_dp_suffix_forwarding_and_health() {
+    let worker = TestWorker::new().await;
+    let config = RouterConfig {
+        enable_igw: true,
+        intra_node_data_parallel_size: 2,
+        policy: PolicyConfig::RoundRobin,
+        disable_retries: true,
+        ..Default::default()
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let context =
+        Arc::new(AppContext::new(config.clone(), client.clone(), 64, None, vec![]).unwrap());
+    let router = vllm_router_rs::routers::http::router::Router::new(vec![], &context)
+        .await
+        .unwrap();
+    let manager = RouterManager::new(
+        config,
+        client,
+        context.worker_registry.clone(),
+        context.policy_registry.clone(),
+    );
+    let identity = format!("{}@1", worker.url);
+    manager
+        .add_worker(serde_json::from_value(json!({"url": identity, "model_id": "test"})).unwrap())
+        .await
+        .unwrap();
+    assert!(!context.worker_registry.get_all()[0].is_dp_aware());
+    let response = router
+        .route_chat(None, &serde_json::from_value(chat()).unwrap(), Some("test"))
+        .await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(*worker.ranks.lock().unwrap(), vec![Some("1".into())]);
+    assert_eq!(
+        router.send_health_check(&identity).await.status(),
+        StatusCode::OK
+    );
+}
+
+async fn registration_survives_discovery_change(initially_available: bool) {
+    let worker = TestWorker::new().await;
+    worker
+        .model_available
+        .store(initially_available, Ordering::SeqCst);
+    let (app, context) = test_app(true).await;
+    let config = json!({"url": worker.url, "dp_rank": 1, "dp_size": 2});
+    let (status, first) = request(&app, "POST", "/workers", config.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let model = if initially_available {
+        "test"
+    } else {
+        "unknown"
+    };
+    assert_eq!(first["worker"]["model_id"], model);
+    worker
+        .model_available
+        .store(!initially_available, Ordering::SeqCst);
+    let (status, second) = request(&app, "POST", "/workers", config.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["worker"]["id"], first["worker"]["id"]);
+    assert_eq!(second["worker"]["model_id"], model);
+    assert_eq!(worker.model_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(context.worker_registry.get_all().len(), 1);
+    assert_eq!(context.worker_registry.get_by_model_fast(model).len(), 1);
+    assert_eq!(context.policy_registry.get_worker_counts()[model], 1);
+    let mut conflict = config;
+    conflict["model_id"] = json!("another-model");
+    let (status, body) = request(&app, "POST", "/workers", conflict).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "WORKER_CONFLICT");
+}
+
+#[tokio::test]
+async fn regression_rank_registration_survives_discovery_outage() {
+    registration_survives_discovery_change(true).await;
+}
+
+#[tokio::test]
+async fn regression_rank_registration_survives_discovery_recovery() {
+    registration_survives_discovery_change(false).await;
+}
+
+#[tokio::test]
+async fn regression_prefill_ranks_allow_distinct_bootstrap_ports() {
+    let (app, context) = test_app(true).await;
+    for (rank, port) in [(0, 9000), (1, 9001)] {
+        let config = json!({"url": "http://worker:8000", "model_id": "test", "worker_type": "prefill",
+            "dp_rank": rank, "dp_size": 2, "bootstrap_port": port});
+        let (status, body) = request(&app, "POST", "/workers", config.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            request(&app, "POST", "/workers", config).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            context
+                .worker_registry
+                .get_by_url(&format!("http://worker:8000@{rank}"))
+                .unwrap()
+                .worker_type(),
+            vllm_router_rs::core::WorkerType::Prefill {
+                bootstrap_port: Some(port)
+            }
+        );
+    }
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/workers",
+        json!({"url": "http://worker:8000", "model_id": "test", "worker_type": "prefill",
+            "dp_rank": 1, "dp_size": 2, "bootstrap_port": 9002}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "WORKER_CONFLICT");
+    assert_eq!(context.worker_registry.get_all().len(), 2);
+    assert_eq!(context.policy_registry.get_worker_counts()["test"], 2);
+}
+
+#[tokio::test]
+async fn concurrent_discovery_reuses_the_model_registered_first() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let queries = Arc::new(AtomicUsize::new(0));
+    let worker_app = Router::new().route(
+        "/get_server_info",
+        get({
+            let started = started.clone();
+            let release = release.clone();
+            move || {
+                let started = started.clone();
+                let release = release.clone();
+                let queries = queries.clone();
+                async move {
+                    if queries.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started.notify_one();
+                        release.notified().await;
+                        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+                    } else {
+                        (StatusCode::OK, Json(json!({"model_id": "test"})))
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, worker_app).await.unwrap() });
+    let (app, context) = test_app(true).await;
+    let config = json!({"url": url, "dp_rank": 1, "dp_size": 2});
+    let first = tokio::spawn({
+        let app = app.clone();
+        let config = config.clone();
+        async move { request(&app, "POST", "/workers", config).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let (status, second) = request(&app, "POST", "/workers", config).await;
+    release.notify_one();
+    let (first_status, first_body) = first.await.unwrap();
+    server.abort();
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    assert_eq!(first_body["worker"]["id"], second["worker"]["id"]);
+    assert_eq!(first_body["worker"]["model_id"], "test");
+    assert_eq!(context.worker_registry.get_all().len(), 1);
+    assert_eq!(context.worker_registry.get_by_model_fast("test").len(), 1);
+    assert_eq!(context.policy_registry.get_worker_counts()["test"], 1);
 }

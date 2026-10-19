@@ -1208,6 +1208,7 @@ impl Router {
     fn worker_endpoint(&self, worker_url: &str) -> (String, Option<usize>) {
         self.worker_registry
             .get_by_url(worker_url)
+            .filter(|worker| worker.is_dp_aware() || self.intra_node_data_parallel_size <= 1)
             .map(|worker| (worker.base_url().to_owned(), worker.dp_rank()))
             .unwrap_or_else(|| dp_utils::parse_worker_url(worker_url))
     }

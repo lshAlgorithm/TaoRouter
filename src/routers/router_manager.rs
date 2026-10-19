@@ -165,12 +165,18 @@ impl RouterManager {
         if config.dp_rank.is_some() {
             config.url = config.url.trim_end_matches('/').to_owned();
         }
+        let rank_url = config.dp_rank.map(|rank| format!("{}@{rank}", config.url));
+        let existing = rank_url
+            .as_deref()
+            .and_then(|url| self.worker_registry.get_by_url(url));
         // Build labels from configuration
         let mut labels = config.labels.clone();
 
         // Query server info if model_id not provided
-        let model_id = if let Some(model_id) = config.model_id {
+        let model_id = if let Some(model_id) = config.model_id.clone() {
             model_id
+        } else if let Some(worker) = existing {
+            worker.model_id().to_owned()
         } else {
             match self.query_server_info(&config.url).await {
                 Ok(info) => {
@@ -188,6 +194,20 @@ impl RouterManager {
                     "unknown".to_string()
                 }
             }
+        };
+
+        let _guard = self
+            .worker_mutations
+            .lock()
+            .expect("Worker mutation lock poisoned");
+        let model_id = match (
+            &config.model_id,
+            rank_url
+                .as_deref()
+                .and_then(|url| self.worker_registry.get_by_url(url)),
+        ) {
+            (None, Some(worker)) => worker.model_id().to_owned(),
+            _ => model_id,
         };
 
         // Add configuration to labels
@@ -222,10 +242,6 @@ impl RouterManager {
                         .with_circuit_breaker_config(CircuitBreakerConfig::default()),
                 )
             };
-        let _guard = self
-            .worker_mutations
-            .lock()
-            .expect("Worker mutation lock poisoned");
         for (id, existing) in self.worker_registry.get_all_with_ids() {
             if existing.url() != worker_arc.url()
                 && existing.base_url().trim_end_matches('/')
@@ -237,7 +253,8 @@ impl RouterManager {
                 continue;
             }
             if existing.dp_size() != worker_arc.dp_size()
-                || existing.worker_type() != worker_arc.worker_type()
+                || std::mem::discriminant(&existing.worker_type())
+                    != std::mem::discriminant(&worker_arc.worker_type())
                 || existing.model_id() != worker_arc.model_id()
             {
                 return Err(WorkerErrorResponse {
@@ -248,9 +265,12 @@ impl RouterManager {
                 });
             }
             if existing.url() == worker_arc.url() {
-                if existing.metadata().labels != worker_arc.metadata().labels {
+                if existing.worker_type() != worker_arc.worker_type()
+                    || existing.metadata().labels != worker_arc.metadata().labels
+                {
                     return Err(WorkerErrorResponse {
-                        error: "DP worker is already registered with different metadata".into(),
+                        error: "DP worker is already registered with a different configuration"
+                            .into(),
                         code: "WORKER_CONFLICT".into(),
                     });
                 }

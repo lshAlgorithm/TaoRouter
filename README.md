@@ -284,6 +284,11 @@ mixing ranked and unranked workers at one endpoint, or inconsistent model,
 worker type, or DP size at one endpoint is rejected. To change a rank's
 configuration, remove it before registering it again.
 
+When `model_id` is omitted for an existing rank, its registered model is reused
+without repeating discovery, including an initial `unknown` result. Prefill
+ranks at one endpoint may use different `bootstrap_port` values; changing the
+port of an existing rank requires removing it first.
+
 Remove a specific rank using its URL-encoded logical identity:
 
 ```bash
