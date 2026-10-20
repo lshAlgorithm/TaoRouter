@@ -3425,6 +3425,91 @@ mod tests {
         RequestLoadGuard::new(Some(worker), Some(KvRequestSlot::new(manager, target, 64)))
     }
 
+    async fn check_health_preserves_guarded_load(registry_checker: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checked = Arc::new(tokio::sync::Notify::new());
+        let handler_checks = checks.clone();
+        let handler_checked = checked.clone();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let checks = handler_checks.clone();
+                let checked = handler_checked.clone();
+                async move {
+                    checks.fetch_add(1, Ordering::Release);
+                    checked.notify_one();
+                    StatusCode::OK
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from(worker.url()),
+            dp_rank: 0,
+        };
+        let old_request = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let health_checker = if registry_checker {
+            let registry = WorkerRegistry::new();
+            registry.register(worker.clone());
+            registry.start_health_checker(1)
+        } else {
+            crate::core::start_health_checker(
+                Arc::new(std::sync::RwLock::new(vec![worker.clone()])),
+                1,
+            )
+        };
+
+        // The next completed health check is after the old tenth-cycle reset,
+        // without invoking reset_load directly or relying on a guessed sleep.
+        let completed = tokio::time::timeout(Duration::from_secs(14), async {
+            while checks.load(Ordering::Acquire) < 11 {
+                checked.notified().await;
+            }
+        })
+        .await;
+        let load_after_checks = worker.load();
+        let new_request = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        drop(old_request);
+        let load_after_old_release = worker.load();
+        let remaining = crate::policies::LoadProvider::sample(manager.as_ref(), &target);
+        drop(new_request);
+        health_checker.shutdown().await;
+        server.abort();
+
+        completed.expect("health checker must execute more than ten cycles");
+        assert_eq!(
+            load_after_checks, 1,
+            "health checks cannot erase active load"
+        );
+        assert_eq!(
+            load_after_old_release, 1,
+            "an older request cannot release a newer request's load"
+        );
+        assert_eq!(remaining.active_requests, 1);
+        assert_eq!(remaining.active_prefill_tokens, 64);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target).active_requests,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_health_checker_preserves_guarded_load() {
+        check_health_preserves_guarded_load(true).await;
+    }
+
+    #[tokio::test]
+    async fn collection_health_checker_preserves_guarded_load() {
+        check_health_preserves_guarded_load(false).await;
+    }
+
     #[tokio::test]
     async fn cancelled_dispatch_releases_only_its_prefill_and_worker_load() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
