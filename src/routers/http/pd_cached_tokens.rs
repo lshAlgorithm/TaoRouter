@@ -33,8 +33,9 @@ pub(super) fn prefill_cached_tokens(prefill: Option<&Value>) -> Option<u64> {
 pub(super) fn reconcile_usage(
     response: &mut Value,
     cached: Option<u64>,
+    prefill: Option<&Value>,
 ) -> Result<bool, &'static str> {
-    let nested = response.get("response").is_some();
+    let (_, details_key, _) = usage_merge::usage_dialect(response, prefill).keys();
     let Some(usage) = usage_merge::usage_object_mut(response) else {
         return if cached.is_some() {
             Err("Decode response has no usage object")
@@ -43,14 +44,6 @@ pub(super) fn reconcile_usage(
         };
     };
 
-    let details_key = if nested
-        || usage.contains_key("input_tokens")
-        || usage.contains_key("input_tokens_details")
-    {
-        "input_tokens_details"
-    } else {
-        "prompt_tokens_details"
-    };
     match usage.get_mut(details_key) {
         Some(Value::Object(details)) => match cached {
             Some(count) => {
@@ -140,6 +133,16 @@ fn sse_lines(mut bytes: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
 }
 
 fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> Bytes {
+    // Most delta frames carry no usage. Avoid collecting data or allocating a
+    // JSON tree for them. Any escape conservatively takes the parse path, since
+    // a valid JSON key can spell "usage" with Unicode escapes.
+    if !frame.contains(&b'\\')
+        && !frame
+            .windows(7)
+            .any(|window| window[0] == b'"' && &window[1..] == b"usage\"")
+    {
+        return Bytes::copy_from_slice(frame);
+    }
     let mut data = Vec::new();
     let mut has_data = false;
     for (line, _) in sse_lines(frame) {
@@ -161,7 +164,7 @@ fn rewrite_frame(frame: &[u8], cached: Option<u64>, prefill: Option<&Value>) -> 
     // Running/per-chunk usage is corrected as soon as its event completes;
     // neither final-frame heuristics nor a following event are required.
     let mut changed = prefill.is_some_and(|value| usage_merge::merge_pd_usage(value, &mut json));
-    match reconcile_usage(&mut json, cached) {
+    match reconcile_usage(&mut json, cached, prefill) {
         Ok(rewritten) => changed |= rewritten,
         Err(reason) => tracing::warn!("Cannot rewrite PD SSE usage: {}", reason),
     }
@@ -589,7 +592,7 @@ mod tests {
             json!({"usage": {"input_tokens": 10, "output_tokens": 2}}),
             json!({"type": "response.completed", "response": {"usage": {"input_tokens": 10, "output_tokens": 2}}}),
         ] {
-            assert_eq!(reconcile_usage(&mut response, Some(4)), Ok(true));
+            assert_eq!(reconcile_usage(&mut response, Some(4), None), Ok(true));
             let usage = usage_merge::usage_object(&response).unwrap();
             assert_eq!(usage["input_tokens_details"], json!({"cached_tokens": 4}));
             assert!(!usage.contains_key("prompt_tokens_details"));
@@ -772,14 +775,14 @@ mod tests {
     #[test]
     fn reconcile_preserves_decode_owned_usage_and_unknown_fields() {
         let mut response = json!({"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120, "prompt_tokens_details": {"cached_tokens": 100, "audio_tokens": 2}, "future_field": 7}, "metrics": {"time_to_first_token_ms": 12.5}});
-        assert_eq!(reconcile_usage(&mut response, Some(64)), Ok(true));
+        assert_eq!(reconcile_usage(&mut response, Some(64), None), Ok(true));
         assert_eq!(
             response["usage"]["prompt_tokens_details"],
             json!({"cached_tokens": 64, "audio_tokens": 2})
         );
         assert_eq!(response["usage"]["future_field"], 7);
         assert_eq!(response["metrics"], json!({"time_to_first_token_ms": 12.5}));
-        assert_eq!(reconcile_usage(&mut response, None), Ok(true));
+        assert_eq!(reconcile_usage(&mut response, None, None), Ok(true));
         assert_eq!(
             response["usage"]["prompt_tokens_details"],
             json!({"audio_tokens": 2})
@@ -789,12 +792,99 @@ mod tests {
     #[test]
     fn zero_cache_creates_details_when_decode_does_not_report_them() {
         let mut response = json!({"usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6, "prompt_tokens_details": null}});
-        assert_eq!(reconcile_usage(&mut response, Some(0)), Ok(true));
+        assert_eq!(reconcile_usage(&mut response, Some(0), None), Ok(true));
         assert_eq!(
             response["usage"]["prompt_tokens_details"],
             json!({"cached_tokens": 0})
         );
         assert_eq!(response["usage"]["completion_tokens"], 2);
+    }
+
+    #[test]
+    fn usage_and_cache_merging_choose_the_same_dialect_in_either_order() {
+        let cases = [
+            (
+                json!({"usage": {"input_tokens": 50, "input_tokens_details": {"cached_tokens": 4, "audio_tokens": 2}}}),
+                json!({"usage": {"output_tokens": 7, "total_tokens": 1006}}),
+                "input_tokens_details",
+            ),
+            (
+                json!({"usage": {"input_tokens_details": {"cached_tokens": 4, "audio_tokens": 2}}}),
+                json!({"usage": {"output_tokens": 7}}),
+                "input_tokens_details",
+            ),
+            (
+                json!({"usage": {"input_tokens": 50}}),
+                json!({"response": {"usage": {"output_tokens": 7}}}),
+                "input_tokens_details",
+            ),
+            (
+                json!({"usage": {"prompt_tokens": 50, "prompt_tokens_details": {"cached_tokens": 4}}}),
+                json!({"usage": {"completion_tokens": 7}}),
+                "prompt_tokens_details",
+            ),
+        ];
+        for (prefill, original, details_key) in cases {
+            let mut usage_first = original.clone();
+            usage_merge::merge_pd_usage(&prefill, &mut usage_first);
+            reconcile_usage(&mut usage_first, Some(4), Some(&prefill)).unwrap();
+            let mut cache_first = original;
+            reconcile_usage(&mut cache_first, Some(4), Some(&prefill)).unwrap();
+            usage_merge::merge_pd_usage(&prefill, &mut cache_first);
+            assert_eq!(usage_first, cache_first);
+            let usage = usage_merge::usage_object(&cache_first).unwrap();
+            assert_eq!(usage[details_key]["cached_tokens"], 4);
+            let other_key = if details_key == "input_tokens_details" {
+                "prompt_tokens_details"
+            } else {
+                "input_tokens_details"
+            };
+            assert!(!usage.contains_key(other_key));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_usage_and_null_usage_deltas_remain_byte_identical() {
+        let input = Bytes::from_static(concat!(
+            ": heartbeat\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"usage\\n\\\"quoted\\\"\"}}],\"usage\":null}\r\r",
+            "data: [DONE]\n\n"
+        ).as_bytes());
+        for size in [1, 7, input.len()] {
+            let output = rewrite_sse_stream(chunks(&input, size), Some(4), None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .concat();
+            assert_eq!(output, input);
+        }
+    }
+
+    #[tokio::test]
+    async fn escaped_usage_keys_still_remove_decode_cache_without_prefill() {
+        for key in [r#""us\u0061ge""#, r#""\u0075\u0073\u0061\u0067\u0065""#] {
+            for nested in [false, true] {
+                let usage = format!(
+                    r#"{{{key}:{{"input_tokens":10,"output_tokens":2,"input_tokens_details":{{"cached_tokens":99,"audio_tokens":1}}}}}}"#
+                );
+                let payload = if nested {
+                    format!(r#"{{"type":"response.completed","response":{usage}}}"#)
+                } else {
+                    usage
+                };
+                let input = Bytes::from(format!("data: {payload}\n\n"));
+                let output = rewrite_sse_stream(chunks(&input, 1), None, None)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+                    .concat();
+                let value: Value = serde_json::from_slice(&output[6..output.len() - 2]).unwrap();
+                let usage = usage_merge::usage_object(&value).unwrap();
+                assert_eq!(usage["input_tokens_details"], json!({"audio_tokens": 1}));
+                assert_eq!(usage["output_tokens"], 2);
+            }
+        }
     }
 
     #[tokio::test]

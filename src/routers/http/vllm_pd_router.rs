@@ -236,7 +236,7 @@ async fn finalize_decode_response(
         if let Some(prefill) = prefill_response_json {
             changed |= usage_merge::merge_pd_usage(prefill, &mut json);
         }
-        match pd_cached_tokens::reconcile_usage(&mut json, cached) {
+        match pd_cached_tokens::reconcile_usage(&mut json, cached, prefill_response_json) {
             Ok(rewritten) => changed |= rewritten,
             Err(reason) => warn!("Cannot reconcile PD cached tokens: {reason}"),
         }

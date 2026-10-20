@@ -22,6 +22,51 @@ pub(super) fn usage_object_mut(value: &mut Value) -> Option<&mut Map<String, Val
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UsageDialect {
+    Completions,
+    Responses,
+}
+
+impl UsageDialect {
+    pub(super) fn keys(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Completions => (
+                "prompt_tokens",
+                "prompt_tokens_details",
+                "completion_tokens",
+            ),
+            Self::Responses => ("input_tokens", "input_tokens_details", "output_tokens"),
+        }
+    }
+}
+
+/// Resolve the payload spelling before mutation. Both usage and cache merging
+/// receive the same Prefill context, so neither relies on the other running first.
+pub(super) fn usage_dialect(response: &Value, prefill: Option<&Value>) -> UsageDialect {
+    fn detect(usage: &Map<String, Value>) -> Option<UsageDialect> {
+        if usage.contains_key("input_tokens") || usage.contains_key("input_tokens_details") {
+            Some(UsageDialect::Responses)
+        } else if usage.contains_key("prompt_tokens") {
+            Some(UsageDialect::Completions)
+        } else {
+            None
+        }
+    }
+
+    if !response.get("usage").is_some_and(Value::is_object)
+        && response
+            .pointer("/response/usage")
+            .is_some_and(Value::is_object)
+    {
+        return UsageDialect::Responses;
+    }
+    usage_object(response)
+        .and_then(detect)
+        .or_else(|| prefill.and_then(usage_object).and_then(detect))
+        .unwrap_or(UsageDialect::Completions)
+}
+
 /// Retain only usage, releasing potentially large KV-transfer metadata before
 /// consuming the Decode stream.
 pub(super) fn usage_snapshot(prefill: &Value) -> Option<Value> {
@@ -41,23 +86,12 @@ fn replace_if_changed(usage: &mut Map<String, Value>, key: &str, value: Value) -
 /// usage. Preserve unknown Decode fields and never synthesize missing usage.
 /// Cache-token ownership/validation is handled by `pd_cached_tokens`.
 pub(super) fn merge_pd_usage(prefill: &Value, decode: &mut Value) -> bool {
+    let (input_key, details_key, output_key) = usage_dialect(decode, Some(prefill)).keys();
     let Some(source) = usage_object(prefill) else {
         return false;
     };
     let Some(target) = usage_object_mut(decode) else {
         return false;
-    };
-    let responses = target.contains_key("input_tokens")
-        || target.contains_key("input_tokens_details")
-        || (!target.contains_key("prompt_tokens") && source.contains_key("input_tokens"));
-    let (input_key, details_key, output_key) = if responses {
-        ("input_tokens", "input_tokens_details", "output_tokens")
-    } else {
-        (
-            "prompt_tokens",
-            "prompt_tokens_details",
-            "completion_tokens",
-        )
     };
     let source_input = source.get(input_key).and_then(Value::as_u64);
     let mut changed = false;
