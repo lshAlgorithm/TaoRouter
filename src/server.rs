@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -283,16 +283,50 @@ async fn epd_chat_completions(
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    request: Request,
 ) -> Response {
+    let (body, raw) = match completion_ingress(request).await {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion_raw(Some(&headers), &body, &raw, None)
         .await
+}
+
+async fn completion_ingress(
+    request: Request,
+) -> Result<(CompletionRequest, axum::body::Bytes), Response> {
+    // Match Axum Json's header check before reading any body, including an
+    // unfinished chunked body. Json::from_bytes retains typed rejection rules.
+    let json_content_type = request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .is_some_and(|value| {
+            value.type_() == "application"
+                && (value.subtype() == "json"
+                    || value.suffix().is_some_and(|suffix| suffix == "json"))
+        });
+    if !json_content_type {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected request with `Content-Type: application/json`",
+        )
+            .into_response());
+    }
+    let raw = axum::body::Bytes::from_request(request, &())
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let Json(body) =
+        Json::<CompletionRequest>::from_bytes(&raw).map_err(IntoResponse::into_response)?;
+    Ok((body, raw))
 }
 
 async fn rerank(
@@ -1275,6 +1309,42 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completion_ingress_rejects_content_type_before_polling_body() {
+        let body = axum::body::Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let request = Request::builder()
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(body)
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), completion_ingress(request))
+            .await
+            .expect("unsupported content type must not wait for the body")
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        for content_type in [
+            "application/json",
+            "application/problem+json; charset=utf-8",
+        ] {
+            let raw = bytes::Bytes::from_static(b" { \"prompt\" : [1, 2] } ");
+            let request = Request::builder()
+                .header(http::header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from(raw.clone()))
+                .unwrap();
+            let (_, preserved) = completion_ingress(request).await.unwrap();
+            assert_eq!(preserved, raw);
+        }
+        let request = Request::builder()
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"prompt":[1],"prompt":[2]}"#))
+            .unwrap();
+        assert_eq!(
+            completion_ingress(request).await.unwrap_err().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
 
     #[tokio::test]
     async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {

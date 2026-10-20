@@ -167,6 +167,15 @@ impl KvIndexSupervisor {
         Ok((supervisor, signals))
     }
 
+    pub(crate) fn worker_has_dense_model(&self, worker_url: &str, model: &str) -> bool {
+        self.dense_http
+            && self
+                .workers
+                .lock()
+                .get(worker_url)
+                .is_some_and(|worker| worker.key.model.as_ref() == model && worker.ranks == [0])
+    }
+
     pub fn hash_mode(&self) -> HashMode {
         self.hash_mode
     }
