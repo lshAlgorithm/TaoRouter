@@ -174,7 +174,7 @@ async fn required_prefill_protocol_is_checked_and_optional_push_body_is_not_requ
             .await;
         assert_eq!(response.status(), 500);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], "upstream_protocol_error");
+        assert_eq!(body["error"]["type"], "server_error");
         assert_eq!(f.d_calls.load(Ordering::SeqCst), 0);
         f.assert_no_load();
         f.warmup().await;

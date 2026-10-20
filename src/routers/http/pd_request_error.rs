@@ -1,4 +1,4 @@
-//! Request-level P/D failures. Raw upstream bytes never participate in formatting.
+//! Request-level P/D failures. Generic formatting omits upstream body data.
 use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -6,8 +6,8 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
-use serde_json::json;
-use std::{fmt, future::Future};
+use serde_json::{json, Value};
+use std::fmt;
 
 pub(super) const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 
@@ -37,6 +37,18 @@ pub(super) fn classify_transport(error: &reqwest::Error) -> TransportErrorKind {
         TransportErrorKind::Connection
     } else {
         TransportErrorKind::Other
+    }
+}
+
+/// Explicit policy supplied by the P/D caller to the generic HTTP tracer.
+pub(super) fn pd_error_description(error: &reqwest::Error) -> &'static str {
+    if error.is_builder() {
+        return "P/D request construction failed";
+    }
+    match classify_transport(error) {
+        TransportErrorKind::Timeout => "P/D upstream timeout",
+        TransportErrorKind::Connection => "P/D upstream connection failed",
+        TransportErrorKind::Other => "P/D upstream transport failed",
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,30 +109,13 @@ impl PdRequestError {
     pub(super) fn protocol(phase: PdPhase) -> Self {
         Self::Protocol { phase }
     }
-    /// These construction/serialization exits were not included in the old
-    /// request counters. Errors from HTTP send/build still use their old exit.
-    pub(super) fn records_legacy_request(&self) -> bool {
-        !matches!(
-            self,
-            Self::Internal(
-                InternalErrorReason::MoriIoTransferModeMissing
-                    | InternalErrorReason::SerializePrefillRequest
-                    | InternalErrorReason::SerializeDecodeRequest
-                    | InternalErrorReason::SerializeRequest
-            )
-        )
-    }
-    pub(super) fn record_worker_error(&self, prefill: &str, decode: &str) {
-        let phase = match self {
-            Self::UpstreamHttp(e) => e.phase,
-            Self::Transport(e) => e.phase,
-            Self::Protocol { phase } => *phase,
-            Self::Internal(InternalErrorReason::RequestBuilder { phase }) => *phase,
-            Self::Internal(_) => return,
-        };
-        match phase {
-            PdPhase::Prefill => crate::metrics::RouterMetrics::record_pd_prefill_error(prefill),
-            PdPhase::Decode => crate::metrics::RouterMetrics::record_pd_decode_error(decode),
+    pub(super) fn phase(&self) -> Option<PdPhase> {
+        match self {
+            Self::UpstreamHttp(e) => Some(e.phase),
+            Self::Transport(e) => Some(e.phase),
+            Self::Protocol { phase }
+            | Self::Internal(InternalErrorReason::RequestBuilder { phase }) => Some(*phase),
+            Self::Internal(_) => None,
         }
     }
     fn status(&self) -> StatusCode {
@@ -134,6 +129,8 @@ impl PdRequestError {
             Self::Protocol { .. } | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+    /// Internal classification and controlled fallback message. Public error
+    /// types are mapped independently when rendering the response.
     fn public_fields(&self) -> (&'static str, String) {
         match self {
             Self::UpstreamHttp(e) => (
@@ -183,6 +180,8 @@ impl fmt::Debug for UpstreamHttpError {
             .finish()
     }
 }
+/// Rendering records a warning and one returned-failure observation. Internal
+/// metric classifications are independent of the public OpenAI error types.
 impl IntoResponse for PdRequestError {
     fn into_response(self) -> Response {
         tracing::warn!(error = %self, details = ?self, "P/D request failed");
@@ -195,7 +194,37 @@ impl IntoResponse for PdRequestError {
             Self::Internal(_) => "router".to_owned(),
         };
         metrics::counter!("vllm_router_pd_phase_errors_total", "phase" => phase, "error_type" => kind).increment(1);
-        let mut response = (self.status(), Json(json!({"error": {"message": message, "type": kind, "code": self.status().as_u16()}}))).into_response();
+        let status = self.status();
+        let public_type = if status == StatusCode::TOO_MANY_REQUESTS {
+            "rate_limit_error"
+        } else if status.is_client_error() {
+            "invalid_request_error"
+        } else {
+            "server_error"
+        };
+        let mut detail = json!({
+            "message": message,
+            "type": public_type,
+            "code": status.as_u16().to_string(),
+        });
+        if let Self::UpstreamHttp(error) = &self {
+            if let Some(upstream) = error.client_detail() {
+                detail["message"] = json!(format!(
+                    "{} {}",
+                    message,
+                    upstream["message"].as_str().unwrap()
+                ));
+                if let Some(param) = upstream.get("param").and_then(Value::as_str) {
+                    detail["param"] = json!(param);
+                }
+                match upstream.get("code") {
+                    Some(Value::String(code)) => detail["code"] = json!(code),
+                    Some(Value::Number(code)) => detail["code"] = json!(code.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        let mut response = (status, Json(json!({"error": detail}))).into_response();
         if let Self::UpstreamHttp(error) = self {
             if let Some(value) = error.headers.get(header::RETRY_AFTER) {
                 response
@@ -204,6 +233,29 @@ impl IntoResponse for PdRequestError {
             }
         }
         response
+    }
+}
+
+impl UpstreamHttpError {
+    /// Retain actionable client diagnostics only for a complete JSON 4xx.
+    /// Unknown fields never enter the public response or generic formatting.
+    fn client_detail(&self) -> Option<Value> {
+        if !self.status.is_client_error() || self.body_state != ErrorBodyState::Complete {
+            return None;
+        }
+        let content_type = self.headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
+        if !content_type
+            .split(';')
+            .next()?
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+        {
+            return None;
+        }
+        let body: Value = serde_json::from_slice(&self.body).ok()?;
+        let error = body.get("error")?.as_object()?;
+        error.get("message")?.as_str()?;
+        Some(Value::Object(error.clone()))
     }
 }
 
@@ -253,10 +305,9 @@ pub(super) async fn capture_upstream_error(
     phase: PdPhase,
     response: reqwest::Response,
 ) -> PdRequestError {
-    assert!(
-        !response.status().is_success(),
-        "error capture requires non-2xx"
-    );
+    if response.status().is_success() {
+        return PdRequestError::protocol(phase);
+    }
     let status = response.status();
     let mut headers = HeaderMap::new();
     if let Some(value) = response.headers().get(header::CONTENT_TYPE) {
@@ -285,34 +336,14 @@ pub(super) async fn capture_upstream_error(
         body,
         body_state,
     };
-    tracing::debug!(details = ?error, "Upstream body omitted");
-    PdRequestError::UpstreamHttp(Box::new(error))
-}
-
-/// Poll both legs, but Prefill's complete validation gates the response. If D
-/// completes first its response is held (backpressure, no output buffering).
-/// Dropping this future drops both sends; P failure immediately drops pending D.
-pub(super) async fn prefill_first<P, D, T>(
-    prefill: P,
-    decode: D,
-) -> Result<(T, reqwest::Response), PdRequestError>
-where
-    P: Future<Output = Result<T, PdRequestError>>,
-    D: Future<Output = Result<reqwest::Response, reqwest::Error>>,
-{
-    tokio::pin!(prefill, decode);
-    tokio::select! {
-        biased;
-        p = &mut prefill => {
-            let p = p?;
-            let d = decode.await.map_err(|e| PdRequestError::from_reqwest(PdPhase::Decode, e))?;
-            Ok((p, d))
-        }
-        d = &mut decode => {
-            let p = prefill.await?;
-            Ok((p, d.map_err(|e| PdRequestError::from_reqwest(PdPhase::Decode, e))?))
-        }
+    if body_state == ErrorBodyState::Complete && tracing::enabled!(tracing::Level::DEBUG) {
+        let preview: String = String::from_utf8_lossy(&error.body)
+            .chars()
+            .take(256)
+            .collect();
+        tracing::debug!(phase = %phase, status = status.as_u16(), preview = ?preview, "Upstream error body preview");
     }
+    PdRequestError::UpstreamHttp(Box::new(error))
 }
 
 /// Stream failures occur after commitment: terminate without synthesizing SSE.
@@ -383,7 +414,10 @@ mod tests {
         ] {
             let error = PdRequestError::Internal(reason);
             assert!(format!("{error:?}").contains(name));
-            assert_eq!(error.records_legacy_request(), records_request);
+            assert_eq!(
+                super::super::pd_dispatch::records_legacy_request(&error),
+                records_request
+            );
             assert_eq!(
                 error.public_fields(),
                 (
@@ -571,53 +605,65 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[tokio::test]
-    async fn failed_prefill_and_future_drop_release_pending_legs() {
-        use futures_util::FutureExt;
-        struct Guard(Arc<AtomicUsize>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
+        // Extend this renderer test rather than duplicate the routing matrix.
+        for (status, content_type, body, code, retained) in [
+            (400, "application/json; charset=utf-8", json!({"error":{"message":"bad max_tokens", "param":"max_tokens", "code":"context_length", "type":"private", "traceback":"private-detail"}}).to_string(), "context_length", true),
+            (429, "Application/JSON", json!({"error":{"message":"retry later", "code":429}}).to_string(), "429", true),
+            (422, "application/json", json!({"error":{"message":"invalid input", "param":7, "code":null}}).to_string(), "422", true),
+            (400, "application/json", "invalid JSON".to_owned(), "400", false),
+            (400, "application/json", json!({"error":{"message":7}}).to_string(), "400", false),
+            (400, "text/html", json!({"error":{"message":"not a JSON media type"}}).to_string(), "400", false),
+            (503, "application/json", json!({"error":{"message":"CUDA OOM"}}).to_string(), "503", false),
+        ] {
+            let upstream = http::Response::builder().status(status)
+                .header("content-type", content_type).header("retry-after", "5")
+                .body(Bytes::from(body.clone())).unwrap();
+            let response = capture_upstream_error(PdPhase::Prefill, reqwest::Response::from(upstream))
+                .await.into_response();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["retry-after"], "5");
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let parsed: crate::protocols::spec::ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+            let expected_type = if status == 429 { "rate_limit_error" } else if status < 500 { "invalid_request_error" } else { "server_error" };
+            assert_eq!(parsed.error.error_type, expected_type);
+            assert_eq!(parsed.error.code.as_deref(), Some(code));
+            let prefix = format!("Upstream prefill request failed (HTTP {status}).");
+            if retained {
+                let source: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(parsed.error.message, format!("{prefix} {}", source["error"]["message"].as_str().unwrap()));
+                assert_eq!(parsed.error.param.as_deref(), source["error"]["param"].as_str());
+            } else {
+                assert_eq!(parsed.error.message, prefix);
             }
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-detail"));
         }
-        let drops = Arc::new(AtomicUsize::new(0));
-        let guard = Guard(drops.clone());
-        let d = futures_util::future::pending::<Result<reqwest::Response, reqwest::Error>>().map(
-            move |result| {
-                drop(guard);
-                result
+        for body_state in [
+            ErrorBodyState::LimitExceeded,
+            ErrorBodyState::ReadFailed {
+                kind: TransportErrorKind::Timeout,
             },
-        );
-        let result = prefill_first(
-            async { Err::<(), _>(PdRequestError::protocol(PdPhase::Prefill)) },
-            d,
-        )
-        .await;
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            let error = UpstreamHttpError {
+                phase: PdPhase::Prefill,
+                status: StatusCode::BAD_REQUEST,
+                headers,
+                body: Bytes::from_static(b"{\"error\":{\"message\":\"incomplete\"}}"),
+                body_state,
+            };
+            assert!(error.client_detail().is_none());
+        }
+        let success = reqwest::Response::from(http::Response::new(Bytes::new()));
         assert!(matches!(
-            result,
-            Err(PdRequestError::Protocol {
+            capture_upstream_error(PdPhase::Prefill, success).await,
+            PdRequestError::Protocol {
                 phase: PdPhase::Prefill
-            })
+            }
         ));
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-        let p_guard = Guard(drops.clone());
-        let d_guard = Guard(drops.clone());
-        let p = futures_util::future::pending::<Result<(), PdRequestError>>().map(move |r| {
-            drop(p_guard);
-            r
-        });
-        let d = futures_util::future::pending::<Result<reqwest::Response, reqwest::Error>>().map(
-            move |r| {
-                drop(d_guard);
-                r
-            },
-        );
-        let mut request = Box::pin(prefill_first(p, d));
-        assert!(futures_util::poll!(&mut request).is_pending());
-        drop(request);
-        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -764,41 +810,5 @@ mod network_tests {
             PdRequestError::from_reqwest(PdPhase::Prefill, error),
             PdRequestError::Internal(InternalErrorReason::RequestBuilder { .. })
         ));
-    }
-}
-
-/// Record at the legacy response-header/error boundary, at most once.
-/// Dropping an unfinished request does not add a terminal observation.
-pub(super) struct RequestMetrics<'a> {
-    route: &'a str,
-    start: std::time::Instant,
-    recorded: bool,
-    count_errors: bool,
-}
-impl<'a> RequestMetrics<'a> {
-    pub(super) fn new(route: &'a str) -> Self {
-        Self {
-            route,
-            start: std::time::Instant::now(),
-            recorded: false,
-            count_errors: true,
-        }
-    }
-    pub(super) fn exclude_legacy_error(&mut self) {
-        self.count_errors = false;
-    }
-    pub(super) fn record_error(&mut self) -> bool {
-        self.count_errors && self.record()
-    }
-    /// Returns true only for the first observation. Response-body failures
-    /// must not count the request or its worker error a second time.
-    pub(super) fn record(&mut self) -> bool {
-        if self.recorded {
-            return false;
-        }
-        self.recorded = true;
-        crate::metrics::RouterMetrics::record_pd_request(self.route);
-        crate::metrics::RouterMetrics::record_pd_request_duration(self.route, self.start.elapsed());
-        true
     }
 }

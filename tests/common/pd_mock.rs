@@ -137,6 +137,23 @@ async fn stage(State(stage): State<Stage>, request: Request) -> Response {
     }
     let forced_status = status.load(Ordering::SeqCst);
     let phase = if stage.prefill { "p" } else { "d" };
+    if stage.prefill && model == "p-error-body-wait" {
+        let first_control = control.clone();
+        let first = futures_util::stream::once(async move {
+            first_control.p_body_started.notify_one();
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"upstream unavailable"))
+        });
+        let release = control.p_body_release.clone();
+        let last = futures_util::stream::once(async move {
+            release.notified().await;
+            Ok::<_, std::io::Error>(bytes::Bytes::new())
+        });
+        return (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::body::Body::from_stream(futures_util::StreamExt::chain(first, last)),
+        )
+            .into_response();
+    }
     if stage.prefill && matches!(model, "p-body-wait" | "p-body-reset") {
         let first_control = control.clone();
         let first = futures_util::stream::once(async move {
@@ -210,13 +227,20 @@ async fn stage(State(stage): State<Stage>, request: Request) -> Response {
     }
     if model == format!("{phase}-error-body-timeout") {
         let first = futures_util::stream::once(async {
-            Ok::<_, std::io::Error>(bytes::Bytes::from_static(SECRET.as_bytes()))
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"incomplete-body-marker"))
         });
         let stream = futures_util::StreamExt::chain(first, futures_util::stream::pending());
         return (
             http::StatusCode::from_u16(if stage.prefill { 503 } else { 429 }).unwrap(),
             [("retry-after", "5")],
             axum::body::Body::from_stream(stream),
+        )
+            .into_response();
+    }
+    if stage.prefill && model == "p-preview" {
+        return (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("{}preview-tail-marker", "界".repeat(256)),
         )
             .into_response();
     }
@@ -458,7 +482,17 @@ pub async fn assert_error(response: reqwest::Response, code: u16, phase: &str) {
     let text = response.text().await.unwrap();
     assert!(!text.contains("secret"), "{text}");
     let json: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(json["error"]["code"], code);
+    assert_eq!(json["error"]["code"], code.to_string());
+    assert_eq!(
+        json["error"]["type"],
+        if code == 429 {
+            "rate_limit_error"
+        } else if (400..500).contains(&code) {
+            "invalid_request_error"
+        } else {
+            "server_error"
+        }
+    );
     assert!(json["error"]["message"].as_str().unwrap().contains(phase));
 }
 

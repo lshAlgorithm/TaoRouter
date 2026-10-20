@@ -9,6 +9,128 @@ use serde_json::json;
 use std::time::Duration;
 
 #[tokio::test]
+async fn failed_prefill_headers_release_decode_before_error_body_eof() {
+    use std::sync::atomic::Ordering;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    for discovery in [false, true] {
+        let f = if discovery {
+            Fixture::profiled_discovery(Duration::from_secs(5)).await
+        } else {
+            Fixture::profiled(Duration::from_secs(5)).await
+        };
+        f.warmup().await;
+        f.control.p_wait.store(true, Ordering::SeqCst);
+        f.control.d_wait.store(true, Ordering::SeqCst);
+        let path = format!("/compat/error-headers/{discovery}");
+        let request = f.router.route_transparent(
+            None,
+            &path,
+            &Method::POST,
+            json!({"model":"p-error-body-wait", "messages":[]}),
+        );
+        tokio::pin!(request);
+        tokio::select! {
+            _ = &mut request => panic!("P and D must remain blocked"),
+            _ = async { f.control.p_seen.notified().await; f.control.d_seen.notified().await; } => {}
+        }
+        f.control.p_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let loads_released = f
+                    .context
+                    .worker_registry
+                    .get_all()
+                    .iter()
+                    .all(|w| w.load() == 0);
+                if loads_released
+                    && f.control.d_profile_stops.load(Ordering::SeqCst) == 2
+                    && counter(&handle, "vllm_router_pd_requests_total", "route", &path) == 1
+                {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut request => panic!("error body must remain blocked"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("failed P headers must release local D and loads before body EOF");
+        f.assert_no_load();
+        f.control.p_body_release.notify_one();
+        assert_eq!(request.await.status(), 503);
+        assert_eq!(
+            counter(&handle, "vllm_router_pd_requests_total", "route", &path),
+            1
+        );
+        f.control.d_release.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn discovery_error_metrics_precede_body_capture_and_survive_cancellation() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    for cancel in [false, true] {
+        let f = Fixture::new(Duration::from_secs(5), true).await;
+        let path = format!("/compat/error-capture/{cancel}");
+        {
+            let request = f.router.route_transparent(
+                None,
+                &path,
+                &Method::POST,
+                json!({"model":"p-error-body-wait", "messages":[]}),
+            );
+            tokio::pin!(request);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if counter(&handle, "vllm_router_pd_requests_total", "route", &path) == 1 {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = &mut request => panic!("error body must remain blocked"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
+            })
+            .await
+            .expect("legacy metrics must be recorded at non-2xx headers");
+            let before = handle.render();
+            let duration = before
+                .lines()
+                .find(|line| {
+                    line.starts_with("vllm_router_pd_request_duration_seconds_sum{")
+                        && line.contains(&format!("route=\"{path}\""))
+                })
+                .expect("duration must be observed before body EOF")
+                .to_owned();
+            assert_eq!(
+                counter(
+                    &handle,
+                    "vllm_router_pd_prefill_errors_total",
+                    "worker",
+                    f._p.url.trim_start_matches("http://")
+                ),
+                1
+            );
+            if !cancel {
+                f.control.p_body_release.notify_one();
+                assert_eq!(request.await.status(), 503);
+                assert!(handle.render().lines().any(|line| line == duration));
+            }
+        }
+        assert_eq!(
+            counter(&handle, "vllm_router_pd_requests_total", "route", &path),
+            1
+        );
+        f.control.p_body_release.notify_one();
+    }
+}
+
+#[tokio::test]
 async fn prefill_json_failure_keeps_the_legacy_direct_discovery_counter_difference() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();

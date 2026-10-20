@@ -16,15 +16,22 @@ pub struct ClientRequestOptions<'a> {
 pub struct PreparedClientRequest {
     request: reqwest::RequestBuilder,
     span: Span,
-    safe_pd_errors: bool,
+    error_description: Option<fn(&reqwest::Error) -> &'static str>,
 }
 
 impl PreparedClientRequest {
+    /// Override the description recorded for send errors without changing the
+    /// returned error. Request phase labels do not select an error policy.
+    pub fn with_error_description(mut self, describe: fn(&reqwest::Error) -> &'static str) -> Self {
+        self.error_description = Some(describe);
+        self
+    }
+
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
         let Self {
             request,
             span,
-            safe_pd_errors,
+            error_description,
         } = self;
 
         let response = if span.is_none() {
@@ -51,11 +58,9 @@ impl PreparedClientRequest {
             }
             Err(error) => {
                 if !span.is_disabled() {
-                    let message = if safe_pd_errors {
-                        pd_transport_description(&error).to_owned()
-                    } else {
-                        error.to_string()
-                    };
+                    let message = error_description
+                        .map(|describe| describe(&error).to_owned())
+                        .unwrap_or_else(|| error.to_string());
                     span.record("error", message.as_str());
                     span.set_status(opentelemetry::trace::Status::error(message));
                 }
@@ -112,7 +117,7 @@ pub fn prepare_client_request(
     PreparedClientRequest {
         request,
         span,
-        safe_pd_errors: matches!(options.request_phase, Some("prefill" | "decode")),
+        error_description: None,
     }
 }
 
@@ -161,17 +166,5 @@ fn record_server_address(span: &Span, url: &str) {
 
     if let Some(port) = parsed.port_or_known_default() {
         span.record("server.port", port);
-    }
-}
-
-fn pd_transport_description(error: &reqwest::Error) -> &'static str {
-    if error.is_builder() {
-        "P/D request construction failed"
-    } else if error.is_timeout() {
-        "P/D upstream timeout"
-    } else if error.is_connect() {
-        "P/D upstream connection failed"
-    } else {
-        "P/D upstream transport failed"
     }
 }

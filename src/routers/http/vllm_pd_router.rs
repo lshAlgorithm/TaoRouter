@@ -2,9 +2,9 @@
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
 use super::logprobs_merge;
+use super::pd_dispatch::{prefill_first, PdDispatchError, RequestMetrics};
 use super::pd_request_error::{
-    capture_upstream_error, decode_stream, prefill_first, InternalErrorReason, PdPhase,
-    PdRequestError, RequestMetrics,
+    decode_stream, pd_error_description, InternalErrorReason, PdPhase, PdRequestError,
 };
 use super::pd_router::PdRouterBase;
 use super::pd_types::PDRouterError;
@@ -784,7 +784,7 @@ impl VllmPDRouter {
         is_streaming: bool,
         needs_logprobs: bool,
         request_metrics: &mut RequestMetrics<'_>,
-    ) -> Result<Response, PdRequestError> {
+    ) -> Result<Response, PdDispatchError> {
         debug!(
             "Decode server responded with status: {}",
             decode_response.status()
@@ -797,7 +797,7 @@ impl VllmPDRouter {
 
         if !decode_response.status().is_success() {
             RouterMetrics::record_pd_decode_error(decode_http);
-            return Err(capture_upstream_error(PdPhase::Decode, decode_response).await);
+            return Err(PdDispatchError::http(PdPhase::Decode, decode_response));
         }
 
         if needs_logprobs && !is_streaming {
@@ -831,7 +831,7 @@ impl VllmPDRouter {
             }
             return response_builder
                 .body(axum::body::Body::from(merged_body))
-                .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse));
+                .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse).into());
         }
 
         debug!(
@@ -852,7 +852,7 @@ impl VllmPDRouter {
             let body = axum::body::Body::from_stream(decode_stream(decode_response));
             return response_builder
                 .body(body)
-                .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse));
+                .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse).into());
         }
 
         // Non-streaming, no logprobs: read entire body
@@ -867,7 +867,7 @@ impl VllmPDRouter {
         }
         response_builder
             .body(axum::body::Body::from(body))
-            .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse))
+            .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse).into())
     }
 
     /// Direct sequential responses historically used a byte stream even when
@@ -883,7 +883,7 @@ impl VllmPDRouter {
         is_streaming: bool,
         needs_logprobs: bool,
         request_metrics: &mut RequestMetrics<'_>,
-    ) -> Result<Response, PdRequestError> {
+    ) -> Result<Response, PdDispatchError> {
         request_metrics.record();
         RouterMetrics::record_pd_prefill_request(prefill_base_url);
         RouterMetrics::record_pd_decode_request(decode_base_url);
@@ -903,7 +903,7 @@ impl VllmPDRouter {
 
         if !decode_response.status().is_success() {
             RouterMetrics::record_pd_decode_error(decode_base_url);
-            return Err(capture_upstream_error(PdPhase::Decode, decode_response).await);
+            return Err(PdDispatchError::http(PdPhase::Decode, decode_response));
         }
 
         let mut response_builder = Response::builder().status(decode_response.status());
@@ -940,7 +940,7 @@ impl VllmPDRouter {
         };
         response_builder
             .body(body)
-            .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse))
+            .map_err(|_| PdRequestError::Internal(InternalErrorReason::BuildResponse).into())
     }
 
     // Keep the legacy worker-labelled phase counters at their original exits.
@@ -964,12 +964,13 @@ impl VllmPDRouter {
                 &mut request_metrics,
             )
             .await;
-        if let Err(error) = &result {
-            if error.records_legacy_request() && request_metrics.record_error() {
-                error.record_worker_error(&prefill_instance.0, &decode_instance.0);
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                request_metrics.record_failure(&error, &prefill_instance.0, &decode_instance.0);
+                Err(error.resolve().await)
             }
         }
-        result
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
@@ -981,7 +982,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         request_metrics: &mut RequestMetrics<'_>,
-    ) -> Result<Response, PdRequestError> {
+    ) -> Result<Response, PdDispatchError> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
 
@@ -1070,7 +1071,7 @@ impl VllmPDRouter {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
 
-            let prefill_response = match otel_http::send_client_request(
+            let prefill_response = match otel_http::prepare_client_request(
                 build_prefill_request_builder(
                     &self.http_client,
                     &prefill_request_url,
@@ -1086,24 +1087,30 @@ impl VllmPDRouter {
                     request_phase: Some("prefill"),
                 },
             )
+            .with_error_description(pd_error_description)
+            .send()
             .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
+                    let error = PdRequestError::from_reqwest(PdPhase::Prefill, e).into();
+                    request_metrics.record_failure(&error, prefill_http, decode_http);
                     self.stop_profiling(&format!("http://{}", prefill_base_http))
                         .await;
-                    return Err(PdRequestError::from_reqwest(PdPhase::Prefill, e));
+                    return Err(error);
                 }
             };
 
             let successful_headers = prefill_response.status().is_success();
-            let result = async {
+            let result: Result<_, PdDispatchError> = async {
                 debug!(
                     "Prefill server responded with status: {}",
                     prefill_response.status()
                 );
                 if !prefill_response.status().is_success() {
-                    return Err(capture_upstream_error(PdPhase::Prefill, prefill_response).await);
+                    let error = PdDispatchError::http(PdPhase::Prefill, prefill_response);
+                    request_metrics.record_failure(&error, prefill_http, decode_http);
+                    return Err(error);
                 }
                 let bytes = prefill_response
                     .bytes()
@@ -1189,8 +1196,9 @@ impl VllmPDRouter {
         if is_concurrent_dispatch {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
+            let mut prefill_profile_stopped = false;
             let prefill_fut = async {
-                let sent = otel_http::send_client_request(
+                let sent = otel_http::prepare_client_request(
                     build_prefill_request_builder(
                         &self.http_client,
                         &prefill_request_url,
@@ -1206,17 +1214,20 @@ impl VllmPDRouter {
                         request_phase: Some("prefill"),
                     },
                 )
+                .with_error_description(pd_error_description)
+                .send()
                 .await;
                 // Discovery has always stopped P at its own response headers,
                 // independently of D and before reading the P response body.
-                self.stop_profiling(&format!("http://{}", prefill_base_http))
-                    .await;
                 let response =
                     sent.map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))?;
                 let status = response.status();
                 if !response.status().is_success() {
-                    return Err(capture_upstream_error(PdPhase::Prefill, response).await);
+                    return Err(PdDispatchError::http(PdPhase::Prefill, response));
                 }
+                self.stop_profiling(&format!("http://{}", prefill_base_http))
+                    .await;
+                prefill_profile_stopped = true;
                 let bytes = response
                     .bytes()
                     .await
@@ -1235,7 +1246,7 @@ impl VllmPDRouter {
                 }
                 Ok(json)
             };
-            let decode_fut = otel_http::send_client_request(
+            let decode_fut = otel_http::prepare_client_request(
                 decode_request_builder.body(decode_request_str),
                 headers,
                 ClientRequestOptions {
@@ -1244,9 +1255,16 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("decode"),
                 },
-            );
+            )
+            .with_error_description(pd_error_description)
+            .send();
             let result = prefill_first(prefill_fut, decode_fut).await;
-            if result.is_err() {
+            if let Err(error) = &result {
+                request_metrics.record_failure(error, prefill_http, decode_http);
+                if !prefill_profile_stopped {
+                    self.stop_profiling(&format!("http://{}", prefill_base_http))
+                        .await;
+                }
                 self.stop_profiling(&format!("http://{}", decode_base_http))
                     .await;
                 // Discovery concurrent mode counted P for either P failure
@@ -1268,7 +1286,7 @@ impl VllmPDRouter {
                 .await;
         }
 
-        let decode_response = match otel_http::send_client_request(
+        let decode_response = match otel_http::prepare_client_request(
             decode_request_builder.body(decode_request_str),
             headers,
             ClientRequestOptions {
@@ -1278,6 +1296,8 @@ impl VllmPDRouter {
                 request_phase: Some("decode"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await
         {
             Ok(resp) => resp,
@@ -1285,7 +1305,7 @@ impl VllmPDRouter {
                 self.stop_profiling(&format!("http://{}", decode_base_http))
                     .await;
                 RouterMetrics::record_pd_prefill_request(prefill_http);
-                return Err(PdRequestError::from_reqwest(PdPhase::Decode, e));
+                return Err(PdRequestError::from_reqwest(PdPhase::Decode, e).into());
             }
         };
 
@@ -1321,12 +1341,17 @@ impl VllmPDRouter {
                 &mut request_metrics,
             )
             .await;
-        if let Err(error) = &result {
-            if error.records_legacy_request() && request_metrics.record_error() {
-                error.record_worker_error(prefill_worker.base_url(), decode_worker.base_url());
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                request_metrics.record_failure(
+                    &error,
+                    prefill_worker.base_url(),
+                    decode_worker.base_url(),
+                );
+                Err(error.resolve().await)
             }
         }
-        result
     }
 
     /// Two-stage request processing for vLLM disaggregated mode
@@ -1342,7 +1367,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         request_metrics: &mut RequestMetrics<'_>,
-    ) -> Result<Response, PdRequestError> {
+    ) -> Result<Response, PdDispatchError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         if !original_request.is_object() {
             return Ok((
@@ -1488,7 +1513,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let prefill_response = match otel_http::send_client_request(
+        let prefill_response = match otel_http::prepare_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
             ClientRequestOptions {
@@ -1498,12 +1523,16 @@ impl VllmPDRouter {
                 request_phase: Some("prefill"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await
         {
             Ok(resp) => resp,
             Err(e) => {
+                let error = PdRequestError::from_reqwest(PdPhase::Prefill, e).into();
+                request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
                 self.stop_profiling(&prefill_base_url).await;
-                return Err(PdRequestError::from_reqwest(PdPhase::Prefill, e));
+                return Err(error);
             }
         };
 
@@ -1520,11 +1549,12 @@ impl VllmPDRouter {
             );
         }
         if !prefill_response.status().is_success() {
-            let error = capture_upstream_error(PdPhase::Prefill, prefill_response).await;
+            let error = PdDispatchError::http(PdPhase::Prefill, prefill_response);
+            request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
             self.stop_profiling(&prefill_base_url).await;
             return Err(error);
         }
-        let prefill_result = async {
+        let prefill_result: Result<_, PdRequestError> = async {
             let bytes = prefill_response
                 .bytes()
                 .await
@@ -1539,7 +1569,7 @@ impl VllmPDRouter {
             Ok(result) => result,
             Err(error) => {
                 self.stop_profiling(&prefill_base_url).await;
-                return Err(error);
+                return Err(error.into());
             }
         };
 
@@ -1551,7 +1581,7 @@ impl VllmPDRouter {
                 .is_some_and(Value::is_object)
         {
             self.stop_profiling(&prefill_base_url).await;
-            return Err(PdRequestError::protocol(PdPhase::Prefill));
+            return Err(PdRequestError::protocol(PdPhase::Prefill).into());
         }
 
         if prefill_bytes.len() < 1024 {
@@ -1643,7 +1673,7 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        let decode_response = match otel_http::send_client_request(
+        let decode_response = match otel_http::prepare_client_request(
             decode_request_builder.json(&decode_request),
             headers,
             ClientRequestOptions {
@@ -1653,13 +1683,15 @@ impl VllmPDRouter {
                 request_phase: Some("decode"),
             },
         )
+        .with_error_description(pd_error_description)
+        .send()
         .await
         {
             Ok(resp) => resp,
             Err(e) => {
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PdRequestError::from_reqwest(PdPhase::Decode, e));
+                return Err(PdRequestError::from_reqwest(PdPhase::Decode, e).into());
             }
         };
 
@@ -1738,7 +1770,7 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         mut ec_transfers: Option<super::epd::EcTransferGuard>,
         request_metrics: &mut RequestMetrics<'_>,
-    ) -> Result<Response, PdRequestError> {
+    ) -> Result<Response, PdDispatchError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
         let decode_base_url = decode_worker.base_url().to_string();
@@ -1769,7 +1801,7 @@ impl VllmPDRouter {
         let mut prefill_profile_stopped = false;
         let (decode_headers_sent, decode_headers_received) = tokio::sync::oneshot::channel();
         let prefill_fut = async {
-            let response = otel_http::send_client_request(
+            let response = otel_http::prepare_client_request(
                 stage_builder(&prefill_url, prefill_dp_rank).json(&prefill_request),
                 headers,
                 ClientRequestOptions {
@@ -1779,10 +1811,12 @@ impl VllmPDRouter {
                     request_phase: Some("prefill"),
                 },
             )
+            .with_error_description(pd_error_description)
+            .send()
             .await
             .map_err(|e| PdRequestError::from_reqwest(PdPhase::Prefill, e))?;
             if !response.status().is_success() {
-                return Err(capture_upstream_error(PdPhase::Prefill, response).await);
+                return Err(PdDispatchError::http(PdPhase::Prefill, response));
             }
             // Preserve the old both-headers load/profiling boundary. Consume
             // P's body concurrently so a reset/timeout can still cancel pending
@@ -1814,7 +1848,7 @@ impl VllmPDRouter {
             Ok(json)
         };
         let decode_fut = async {
-            let response = otel_http::send_client_request(
+            let response = otel_http::prepare_client_request(
                 stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
                 headers,
                 ClientRequestOptions {
@@ -1824,11 +1858,16 @@ impl VllmPDRouter {
                     request_phase: Some("decode"),
                 },
             )
+            .with_error_description(pd_error_description)
+            .send()
             .await;
             let _ = decode_headers_sent.send(());
             response
         };
         let result = prefill_first(prefill_fut, decode_fut).await;
+        if let Err(error) = &result {
+            request_metrics.record_failure(error, &prefill_base_url, &decode_base_url);
+        }
         drop(prefill_load);
         drop(decode_load);
         if !prefill_profile_stopped {
