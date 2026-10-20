@@ -347,32 +347,49 @@ impl Router {
         };
         let default_policy = ctx.policy_registry.get_default_policy();
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) =
-            if kv_aware_ops(default_policy.as_ref()).is_some() {
-                let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
+        let (kv_index_supervisor, kv_signal_handle) = if kv_aware_ops(default_policy.as_ref())
+            .is_some()
+        {
+            let (supervisor, mut signals) = if pool_kind
+                == Some(crate::backend::WorkerPoolKind::Http)
+                && std::env::var_os("VLLM_ROUTER_KV_EVENT_SOURCES").is_some()
+            {
+                if dp_size != 1 {
+                    return Err(
+                        "static HTTP KV sources require independently addressed DP1 workers".into(),
+                    );
+                }
+                crate::kv_index::KvIndexSupervisor::new_http_dense(
                     ctx.client.clone(),
                     crate::kv_index::HashMode::Sha256,
-                );
-                let supervisor = Arc::new(supervisor);
-                for worker_url in &kv_discovery_urls {
-                    match supervisor.on_worker_added(worker_url).await {
-                        Ok(info) => {
-                            kv_worker_info.insert(worker_url.clone(), info);
-                        }
-                        Err(error) => warn!(
-                            worker_url,
-                            %error,
-                            "kv_aware discovery failed; worker will use load-only scoring"
-                        ),
-                    }
-                }
-                let signal_handle = Arc::new(tokio::spawn(async move {
-                    while signals.recv().await.is_some() {}
-                }));
-                (Some(supervisor), Some(signal_handle))
+                    &kv_discovery_urls,
+                )?
             } else {
-                (None, None)
+                crate::kv_index::KvIndexSupervisor::new(
+                    ctx.client.clone(),
+                    crate::kv_index::HashMode::Sha256,
+                )
             };
+            let supervisor = Arc::new(supervisor);
+            for worker_url in &kv_discovery_urls {
+                match supervisor.on_worker_added(worker_url).await {
+                    Ok(info) => {
+                        kv_worker_info.insert(worker_url.clone(), info);
+                    }
+                    Err(error) => warn!(
+                        worker_url,
+                        %error,
+                        "kv_aware discovery failed; worker will use load-only scoring"
+                    ),
+                }
+            }
+            let signal_handle = Arc::new(tokio::spawn(async move {
+                while signals.recv().await.is_some() {}
+            }));
+            (Some(supervisor), Some(signal_handle))
+        } else {
+            (None, None)
+        };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
