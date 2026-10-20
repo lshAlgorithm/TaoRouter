@@ -2,46 +2,53 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
-// Helper function to parse prefill arguments from command line
-// Returns prefill_entries with (URL, optional_bootstrap_port)
-fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut prefill_entries = Vec::new();
-    let mut i = 0;
+type PrefillArgs = (String, Option<u16>);
+fn split_prefill_args_from_others(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(Vec<PrefillArgs>, Vec<String>), String> {
+    let mut args = args.into_iter().peekable();
+    let mut prefill = vec![];
+    let mut other = vec![];
 
-    while i < args.len() {
-        if args[i] == "--prefill" && i + 1 < args.len() {
-            let url = args[i + 1].clone();
-
-            let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
-                // Check if next arg is a port number
-                if let Ok(port) = args[i + 2].parse::<u16>() {
-                    i += 1; // Skip the port argument
-                    Some(port)
-                } else if args[i + 2].to_lowercase() == "none" {
-                    i += 1; // Skip the "none" argument
-                    None
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            prefill_entries.push((url, bootstrap_port));
-            i += 2; // Skip --prefill and URL
-        } else {
-            i += 1;
+    while let Some(arg) = args.next() {
+        if arg != ("--prefill") {
+            other.push(arg);
+            continue;
         }
+        // require a URL after we see the --prefill argument
+        let url = args
+            .next()
+            .ok_or("--prefill requires a URL immediately after")?;
+        if url.starts_with("-") {
+            return Err(format!("Invalid url {url}"));
+        }
+
+        // optional port afterwards
+        let port = match args.peek() {
+            Some(arg) if arg.eq_ignore_ascii_case("none") => {
+                args.next(); // consume it and ignore
+                None
+            }
+            Some(arg) if !arg.starts_with("-") => match arg.parse::<u16>() {
+                Ok(port) => {
+                    args.next();
+                    Some(port)
+                }
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        prefill.push((url, port))
     }
 
-    prefill_entries
+    Ok((prefill, other))
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -80,8 +87,11 @@ This launcher enables starting a router with individual worker instances. It is 
 multi-node setups or when you want to start workers and router separately.
 
 Examples:
-  # Regular mode
+  # Regular mode (HTTP reverse-proxy of OpenAI messages)
   vllm-router --worker-urls http://worker1:8000 http://worker2:8000
+
+  # Regular mode with a vLLM rust Inference worker (router sends token_ids)
+  vllm-router --worker-urls grpc://worker1:50051
 
   # vLLM PD mode with pure service discovery (workers register themselves)
   vllm-router --vllm-pd-disaggregation \
@@ -94,6 +104,9 @@ Examples:
 
 "#)]
 struct CliArgs {
+    /// E+PD or E/P/D encoder orchestration as JSON (encoder_urls, consumer_zmq_addrs).
+    #[arg(long)]
+    epd_config: Option<String>,
     /// Host address to bind the router server
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -102,13 +115,23 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000)]
     port: u16,
 
-    /// List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)
+    /// List of worker URLs (`http(s)://` reverse-proxy, or `grpc://` Inference)
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
+
+    /// Enable Program-level scheduling independently of the request-level
+    /// load-balancing policy.
+    #[arg(long, default_value_t = false)]
+    enable_program_scheduling: bool,
+
+    /// Optional JSON object overriding Program-level scheduling defaults.
+    /// Requires --enable-program-scheduling.
+    #[arg(long)]
+    program_scheduling_config_json: Option<String>,
 
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
@@ -162,6 +185,19 @@ struct CliArgs {
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
     max_payload_size: usize,
+
+    /// Path to a WASM Component Model OnRequest middleware artifact
+    #[arg(long)]
+    wasm_middleware: Option<String>,
+
+    /// Optional SHA-256 hex digest that must match --wasm-middleware
+    #[arg(long)]
+    wasm_middleware_sha256: Option<String>,
+
+    /// HTTP paths that invoke the WASM middleware (repeatable).
+    /// Defaults to /v1/chat/completions when --wasm-middleware is set.
+    #[arg(long = "wasm-middleware-route", action = ArgAction::Append)]
+    wasm_middleware_routes: Vec<String>,
 
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[arg(long, default_value_t = 1)]
@@ -246,6 +282,12 @@ struct CliArgs {
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
+
+    /// Idle timeout in seconds for pooled backend HTTP connections. Should be
+    /// lower than the backend's keep-alive timeout (vLLM defaults to 5s); 0
+    /// disables connection reuse entirely
+    #[arg(long, default_value_t = vllm_router_rs::server::DEFAULT_POOL_IDLE_TIMEOUT_SECS)]
+    pool_idle_timeout_secs: u64,
 
     /// Maximum number of concurrent requests allowed
     #[arg(long, default_value_t = 32768)]
@@ -499,8 +541,21 @@ impl CliArgs {
             Vec::new()
         };
 
+        let program_scheduling = ProgramSchedulingConfig::resolve(
+            self.enable_program_scheduling,
+            self.program_scheduling_config_json.as_deref(),
+        )?;
+
         // Build RouterConfig
         Ok(RouterConfig {
+            epd: self
+                .epd_config
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| vllm_router_rs::config::ConfigError::ValidationFailed {
+                    reason: format!("Invalid --epd-config: {e}"),
+                })?,
             mode,
             policy,
             connection_mode,
@@ -557,6 +612,7 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            program_scheduling,
         })
     }
 
@@ -591,11 +647,15 @@ impl CliArgs {
             port: self.port,
             router_config,
             max_payload_size: self.max_payload_size,
+            wasm_middleware: self.wasm_middleware.clone(),
+            wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+            wasm_middleware_routes: self.wasm_middleware_routes.clone(),
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
             service_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
+            pool_idle_timeout_secs: self.pool_idle_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
                 None
             } else {
@@ -624,34 +684,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse prefill arguments manually before clap parsing
     println!("DEBUG: Parsing prefill arguments");
-    let prefill_urls = parse_prefill_args();
+    let (prefill_urls, filtered_args) = split_prefill_args_from_others(std::env::args())?;
     println!("DEBUG: Prefill URLs parsed: {:?}", prefill_urls);
-
-    // Filter out prefill arguments and their values before passing to clap
-    println!("DEBUG: Filtering CLI arguments");
-    let mut filtered_args: Vec<String> = Vec::new();
-    let raw_args: Vec<String> = std::env::args().collect();
-    println!("DEBUG: Raw args: {:?}", raw_args);
-    let mut i = 0;
-
-    while i < raw_args.len() {
-        if raw_args[i] == "--prefill" && i + 1 < raw_args.len() {
-            // Skip --prefill and its URL
-            i += 2;
-
-            // Also skip bootstrap port if present
-            if i < raw_args.len()
-                && !raw_args[i].starts_with("--")
-                && (raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none")
-            {
-                i += 1;
-            }
-        } else {
-            filtered_args.push(raw_args[i].clone());
-            i += 1;
-        }
-    }
-
     // Parse CLI arguments with clap using filtered args
     println!("DEBUG: Parsing CLI arguments with clap");
     println!("DEBUG: Filtered args: {:?}", filtered_args);
@@ -737,4 +771,94 @@ Provide --worker-urls or PD flags as usual.",
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_wasm_middleware_options() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--wasm-middleware",
+            "/tmp/example.component.wasm",
+            "--wasm-middleware-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--wasm-middleware-route",
+            "/v1/chat/completions",
+            "--wasm-middleware-route",
+            "/v1/completions",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.wasm_middleware.as_deref(),
+            Some("/tmp/example.component.wasm")
+        );
+        assert_eq!(
+            args.wasm_middleware_routes,
+            vec!["/v1/chat/completions", "/v1/completions"]
+        );
+    }
+
+    #[test]
+    fn splits_prefill_args_and_preserves_other_args() {
+        let args = [
+            "vllm-router",
+            "--port",
+            "3000",
+            "--prefill",
+            "http://prefill-0:8000",
+            "9000",
+            "--policy",
+            "random",
+            "--prefill",
+            "http://prefill-1:8000",
+            "none",
+            "--prefill",
+            "http://prefill-2:8000",
+            "-h",
+        ]
+        .map(String::from);
+
+        let (prefill, other) = split_prefill_args_from_others(args).unwrap();
+
+        assert_eq!(
+            prefill,
+            vec![
+                ("http://prefill-0:8000".to_string(), Some(9000)),
+                ("http://prefill-1:8000".to_string(), None),
+                ("http://prefill-2:8000".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            other,
+            ["vllm-router", "--port", "3000", "--policy", "random", "-h"]
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_flag_prefill_urls() {
+        let missing_url = ["vllm-router", "--prefill"].map(String::from);
+        assert_eq!(
+            split_prefill_args_from_others(missing_url).unwrap_err(),
+            "--prefill requires a URL immediately after"
+        );
+
+        let flag_as_url = ["vllm-router", "--prefill", "--help"].map(String::from);
+        assert_eq!(
+            split_prefill_args_from_others(flag_as_url).unwrap_err(),
+            "Invalid url --help"
+        );
+    }
+
+    #[test]
+    fn preserves_out_of_range_prefill_port_for_clap() {
+        let args = ["vllm-router", "--prefill", "http://prefill:8000", "65536"].map(String::from);
+
+        let (prefill, other) = split_prefill_args_from_others(args).unwrap();
+
+        assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
+        assert_eq!(other, ["vllm-router", "65536"]);
+    }
 }
