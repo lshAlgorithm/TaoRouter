@@ -22,11 +22,34 @@ impl PreparedCompletion {
     }
 }
 
+/// Distinguishes an ineligible optimization from invalid input or service failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompletionPreparationError {
+    Unsupported(String),
+    InvalidRequest(String),
+    ServiceFailure(String),
+}
+
+impl std::fmt::Display for CompletionPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(message)
+            | Self::InvalidRequest(message)
+            | Self::ServiceFailure(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CompletionPreparationError {}
+
 /// Reject tokenizer definitions that silently truncate or pad exact input.
 ///
 /// Validate the same definition that will be loaded into the tokenizer. This
-/// checks Hugging Face syntax, not asset provenance or worker conformance, and
-/// cannot certify an already-created arbitrary `Tokenizer` trait object.
+/// checks this `tokenizer.json`, not asset provenance or worker conformance,
+/// and cannot certify an already-created arbitrary `Tokenizer` trait object.
+/// `HuggingFaceTokenizer::new_hf` also merges added tokens from the sibling
+/// `tokenizer_config.json`; callers must keep both files immutable and validate
+/// the effective loaded backend separately when establishing worker alignment.
 pub fn validate_completion_tokenizer_definition(definition: &Value) -> Result<(), String> {
     for field in ["truncation", "padding"] {
         if definition.get(field).is_some_and(|value| !value.is_null()) {
@@ -50,49 +73,123 @@ pub fn prepare_completion(
     tokenizer: &dyn Tokenizer,
     model_vocab_size: u32,
 ) -> Result<PreparedCompletion, String> {
+    prepare_completion_classified(request, tokenizer, model_vocab_size)
+        .map_err(|error| error.to_string())
+}
+
+/// Classify preparation without certifying the remote worker's serving contract.
+///
+/// Success is exact preparation for this restricted input contract. Explicit IDs
+/// and the special-token switch are checked before unsupported modifiers, so an
+/// ineligible optimization cannot mask known invalid input. Only `Unsupported`
+/// may use an independently valid ordinary execution path.
+pub fn prepare_completion_classified(
+    request: &CompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    model_vocab_size: u32,
+) -> Result<PreparedCompletion, CompletionPreparationError> {
+    use CompletionPreparationError::{InvalidRequest, ServiceFailure, Unsupported};
+
     if model_vocab_size == 0 {
-        return Err("completion model vocabulary must be nonzero".into());
+        return Err(ServiceFailure(
+            "completion model vocabulary must be nonzero".into(),
+        ));
     }
+    match &request.prompt {
+        PromptInput::IntArray(ids) => validate_prompt_ids(ids, model_vocab_size)?,
+        PromptInput::IntBatch(batch) => {
+            for ids in batch {
+                validate_prompt_ids(ids, model_vocab_size)?;
+            }
+        }
+        _ => {}
+    }
+    let add_special_tokens = request
+        .other
+        .get("add_special_tokens")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                InvalidRequest("completion add_special_tokens must be a boolean".into())
+            })
+        })
+        .transpose()?
+        .unwrap_or(true);
     if request.lora_path.is_some() {
-        return Err("completion preparation does not support lora_path".into());
+        return Err(Unsupported(
+            "completion preparation does not support lora_path".into(),
+        ));
     }
     if request.session_params.is_some() {
-        return Err("completion preparation does not support session_params".into());
+        return Err(Unsupported(
+            "completion preparation does not support session_params".into(),
+        ));
     }
     if request.suffix.is_some() {
-        return Err("completion preparation does not support suffix".into());
+        return Err(Unsupported(
+            "completion preparation does not support suffix".into(),
+        ));
     }
-    let mut add_special_tokens = true;
     for (field, value) in &request.other {
-        if field != "add_special_tokens" {
-            return Err(format!("completion preparation does not support {field}"));
+        // vLLM 0.29 Completion priority controls engine scheduling, not input
+        // rendering or cache identity. Other extension fields remain a valid
+        // ordinary-path fallback until their input and namespace contracts are
+        // established; in particular LoRA and salt are not sampling options.
+        if field != "add_special_tokens" && !(field == "priority" && value.as_i64().is_some()) {
+            return Err(Unsupported(format!(
+                "completion preparation does not support {field}"
+            )));
         }
-        add_special_tokens = value
-            .as_bool()
-            .ok_or_else(|| "completion add_special_tokens must be a boolean".to_string())?;
     }
     let token_ids = match &request.prompt {
-        PromptInput::String(text) => tokenizer
-            .encode(text, add_special_tokens)
-            .map_err(|error| format!("completion tokenization failed: {error}"))?,
-        PromptInput::IntArray(ids) => ids
-            .iter()
-            .map(|&id| {
-                u32::try_from(id)
-                    .map_err(|_| format!("completion prompt contains negative token ID {id}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        PromptInput::String(text) => {
+            let ids = tokenizer
+                .encode(text, add_special_tokens)
+                .map_err(|error| {
+                    ServiceFailure(format!("completion tokenization failed: {error}"))
+                })?;
+            if let Some(id) = ids.iter().find(|&&id| id >= model_vocab_size) {
+                return Err(ServiceFailure(format!(
+                    "completion token ID {id} is outside model vocabulary size {model_vocab_size}"
+                )));
+            }
+            ids
+        }
+        PromptInput::IntArray(ids) => ids.iter().map(|&id| id as u32).collect(),
         PromptInput::StringArray(_) | PromptInput::IntBatch(_) => {
-            return Err("completion preparation does not support batched prompts".into());
+            return Err(Unsupported(
+                "completion preparation does not support batched prompts".into(),
+            ));
         }
     };
     if token_ids.is_empty() {
-        return Err("completion preparation requires nonempty token input".into());
-    }
-    if let Some(id) = token_ids.iter().find(|&&id| id >= model_vocab_size) {
-        return Err(format!(
-            "completion token ID {id} is outside model vocabulary size {model_vocab_size}"
+        return Err(InvalidRequest(
+            "completion preparation requires nonempty token input".into(),
         ));
     }
     Ok(PreparedCompletion { token_ids })
+}
+
+fn validate_prompt_ids(
+    ids: &[i32],
+    model_vocab_size: u32,
+) -> Result<(), CompletionPreparationError> {
+    use CompletionPreparationError::InvalidRequest;
+    if ids.is_empty() {
+        return Err(InvalidRequest(
+            "completion preparation requires nonempty token input".into(),
+        ));
+    }
+    for &id in ids {
+        if id < 0 {
+            return Err(InvalidRequest(format!(
+                "completion prompt contains negative token ID {id}"
+            )));
+        }
+        if id as u32 >= model_vocab_size {
+            return Err(InvalidRequest(format!(
+                "completion token ID {id} is outside model vocabulary size {model_vocab_size}"
+            )));
+        }
+    }
+    Ok(())
 }
