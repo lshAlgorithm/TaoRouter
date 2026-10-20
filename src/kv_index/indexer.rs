@@ -1,12 +1,15 @@
 //! Concurrent radix-tree index of resident KV blocks, keyed by local hash.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use crate::kv_index::types::{ClearScope, Locality, ResidencyOwner, RoutableTarget, StorageTier};
+use crate::kv_index::types::{
+    ClearScope, Locality, ResidencyOwner, RoutableTarget, SourceId, StorageTier,
+};
 
 /// One request's query against the index.
 #[derive(Debug, Clone)]
@@ -19,14 +22,16 @@ pub struct MatchQuery {
     pub tiers_of_interest: Vec<StorageTier>,
 }
 
-/// One hit: a target holds a contiguous prefix `[0, depth)` at this tier.
-/// Flat so the policy sorts in one pass — one entry per `(target, tier)`.
+/// One hit: the block intervals `[start, end)` a target holds at this tier,
+/// each maximal. Flat — one row per `(target, tier)` — so the cost model
+/// applies two-segment reuse over a target's tiers in one pass.
 #[derive(Debug, Clone)]
 pub struct TierMatch {
     pub target: RoutableTarget,
     pub tier: StorageTier,
-    /// Contiguous prefix depth (blocks `[0, depth)`).
-    pub matched_depth: u32,
+    /// Held block intervals `[start, end)`, each maximal; a gap closes a
+    /// segment but later segments survive.
+    pub segments: Vec<(u32, u32)>,
     pub locality: Locality,
 }
 
@@ -39,11 +44,21 @@ type EdgeBlock = (HashSet<Arc<str>>, Arc<str>); // (historical seq hashes, local
 std::thread_local! {
     static AFTER_ANCHOR_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_QUERY_EDGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn after_anchor_clone() {
     let hook = AFTER_ANCHOR_CLONE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn after_query_edge() {
+    let hook = AFTER_QUERY_EDGE.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -145,17 +160,15 @@ impl GroupShard {
         blocks: &[IncomingBlock],
     ) {
         let key = (owner, tier);
-        // Preserve the inherited unknown-parent root fallback, not ancestry
-        // recovery: block-local hashes cannot prove a full request prefix.
-        // Missing-ancestry recovery/trust gating belongs to the source lifecycle.
-        // Later cursors were recorded here and must follow their current anchor.
-        let mut cursor = parent_seq.filter(|seq| {
-            let known = self.anchors.contains_key(seq);
-            if !known && !seq.is_empty() {
-                tracing::debug!(parent_seq = %seq, "kv_index: unknown parent; using root fallback");
+        // An unknown ancestor cannot be replaced by root: block-local hashes
+        // do not prove that this suffix is a stand-alone request prefix.
+        if let Some(seq) = &parent_seq {
+            if !self.anchors.contains_key(seq) {
+                tracing::debug!(parent_seq = %seq, "kv_index: unknown parent; skipping unanchored store");
+                return;
             }
-            known
-        });
+        }
+        let mut cursor = parent_seq;
         let mut bi = 0;
         while bi < blocks.len() {
             let node = match &cursor {
@@ -335,6 +348,28 @@ impl GroupShard {
         }
     }
 
+    /// Forget only this publisher/rank's observations, including pool copies
+    /// attributed to it. A pool-wide clear would erase other publishers too.
+    fn clear_source(&self, source: &SourceId, dp_rank: u32) {
+        let keys: Vec<OwnerTier> = self
+            .reverse
+            .iter()
+            .filter(|entry| {
+                let target = entry.key().0.target();
+                target.instance_id == *source && target.dp_rank == dp_rank
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            let seqs: Vec<Arc<str>> = self
+                .reverse
+                .get(&key)
+                .map(|seqs| seqs.iter().cloned().collect())
+                .unwrap_or_default();
+            self.remove(&key.0, key.1, &seqs);
+            self.reverse.remove_if(&key, |_, seqs| seqs.is_empty());
+        }
+    }
     /// Drop the logical block claim only after its last active alias is gone.
     fn remove_claim(&self, seq: &Arc<str>, key: &OwnerTier) {
         // Contract: within a shard an engine key always identifies the same
@@ -369,71 +404,87 @@ impl GroupShard {
         }
     }
 
-    /// Walk the request's `local_hashes` from the root; per `(target, tier)`,
-    /// the matched depth is the deepest `d` where the target owns a contiguous
-    /// `(owner, tier)` claim on every node in `[0, d)`. Each edge element's
-    /// claims are the claims of the node that edge belongs to.
+    /// Walk the request's `local_hashes` from the root, collecting the
+    /// per-position `(owner, tier)` claims along the matched prefix; the
+    /// collapse below builds maximal `[start, end)` segments from them. Each
+    /// edge element's claims are the claims of the node that edge belongs to.
     pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
         let mut node_claims: Vec<Vec<OwnerTier>> = Vec::with_capacity(query.local_hashes.len());
-        let mut cur = self.root.clone();
         let mut qi = 0; // index into query.local_hashes
-        while qi < query.local_hashes.len() {
-            let child_local = &query.local_hashes[qi];
-            let child = {
-                let n = cur.read();
-                n.children.get(child_local).cloned()
-            };
-            let child = match child {
-                Some(c) => c,
-                None => break,
-            };
-            // Match under the read guard and copy only matching claims, never
-            // the potentially unbounded historical identity sets.
-            let (advanced, fully_matched) = {
-                let c = child.read();
-                let mut advanced = 0;
-                while advanced < c.edge.len()
-                    && qi + advanced < query.local_hashes.len()
-                    && c.edge[advanced].1 == query.local_hashes[qi + advanced]
-                {
-                    node_claims.push(c.claims[advanced].clone());
-                    advanced += 1;
-                }
-                (advanced, advanced == c.edge.len())
-            };
-            // Retain the matched prefix, but never skip an unmatched edge suffix.
-            if !fully_matched {
+        let mut next = query
+            .local_hashes
+            .first()
+            .and_then(|local| self.root.read().children.get(local).cloned());
+        while let Some(child) = next {
+            // Match and resolve the next child under the same read guard. A
+            // split moves children behind the remainder edge; re-reading this
+            // node's children after advancing by its old length misaligns depth.
+            let c = child.read();
+            let mut advanced = 0;
+            while advanced < c.edge.len()
+                && qi + advanced < query.local_hashes.len()
+                && c.edge[advanced].1 == query.local_hashes[qi + advanced]
+            {
+                // Copy only matched claims, never historical alias sets.
+                node_claims.push(c.claims[advanced].clone());
+                advanced += 1;
+            }
+            // Partial edge match: children sit after the full edge in the chain,
+            // so descending on a partial match misaligns chain positions.
+            if advanced == 0 || advanced < c.edge.len() {
                 break;
             }
             qi += advanced;
-            cur = child;
+            next = query
+                .local_hashes
+                .get(qi)
+                .and_then(|local| c.children.get(local).cloned());
+            drop(c);
+            #[cfg(test)]
+            after_query_edge();
         }
 
-        // Per (target, tier), advance depth only while the owner claims every
-        // node [0, depth] contiguously. The index stores by owner but answers
-        // by target; locality is derived from the owner domain.
+        // Per (target, tier), run-length collect the maximal contiguous
+        // [start, end) block intervals the target holds at that tier. The index
+        // stores by owner but answers by target; locality is derived from the
+        // owner domain. A `(target, tier)` may have several owners at one
+        // depth (e.g. two pools pushed the same block); each depth is counted
+        // once, so the segment extends by one, not per owner.
         let mut best: HashMap<(RoutableTarget, StorageTier), TierMatch> = HashMap::new();
+        // Reused across depths; avoids a per-block allocation on the hot path.
+        let mut seen: HashSet<(RoutableTarget, StorageTier)> = HashSet::new();
         for (depth, owners) in node_claims.iter().enumerate() {
+            seen.clear();
             for (owner, tier) in owners {
                 if !query.tiers_of_interest.contains(tier) {
                     continue;
                 }
                 let target = owner.target();
-                let key = (target.clone(), *tier);
-                let entry = best.entry(key).or_insert(TierMatch {
-                    target: target.clone(),
+                let first_at_depth = seen.insert((target.clone(), *tier));
+                let owner_locality = owner.locality();
+                let entry = best.entry((target.clone(), *tier)).or_insert(TierMatch {
+                    target,
                     tier: *tier,
-                    matched_depth: 0,
-                    locality: owner.locality(),
+                    segments: Vec::new(),
+                    locality: owner_locality,
                 });
-                if (entry.matched_depth as usize) == depth {
-                    entry.matched_depth = (depth + 1) as u32;
+                // Segment extension is per depth, but every owner contributes
+                // to locality. Prefer the closest copy regardless of claim order.
+                if owner_locality == Locality::Local {
+                    entry.locality = Locality::Local;
                 }
-                entry.locality = owner.locality();
+                if !first_at_depth {
+                    continue;
+                }
+                match entry.segments.last_mut() {
+                    Some((_, e)) if *e == depth as u32 => *e = (depth + 1) as u32,
+                    _ => entry.segments.push((depth as u32, (depth + 1) as u32)),
+                }
             }
         }
-        // A 0-depth entry = no prefix match; absence, not a value to filter.
-        best.into_values().filter(|m| m.matched_depth > 0).collect()
+        best.into_values()
+            .filter(|m| !m.segments.is_empty())
+            .collect()
     }
 }
 
@@ -444,12 +495,17 @@ pub struct KvBlockIndexer {
     // ponytail: group_idx is None on the wire → 0; single-spec models have one
     // group and multi-spec always emits group_idx, so 0 is a safe default.
     shards: DashMap<u32, Arc<GroupShard>>,
+    suspended_sources: DashMap<(SourceId, u32), ()>,
+    /// Reject query snapshots crossing an invalidation/resume boundary.
+    source_generation: AtomicU64,
 }
 
 impl KvBlockIndexer {
     pub fn new() -> Self {
         KvBlockIndexer {
             shards: DashMap::new(),
+            suspended_sources: DashMap::new(),
+            source_generation: AtomicU64::new(0),
         }
     }
 
@@ -495,8 +551,44 @@ impl KvBlockIndexer {
         }
     }
 
+    /// Hide a source's observations while contiguous replay repairs its state.
+    /// Correctness does not depend on delivery of advisory ingestion signals.
+    pub fn suspend_source(&self, source: &SourceId, dp_rank: u32) {
+        self.suspended_sources.insert((source.clone(), dp_rank), ());
+        self.source_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Stop crediting a lossy source and discard all its old observations.
+    pub fn invalidate_source(&self, source: &SourceId, dp_rank: u32) {
+        self.suspend_source(source, dp_rank);
+        let shards: Vec<Arc<GroupShard>> = self.shards.iter().map(|e| e.value().clone()).collect();
+        for shard in shards {
+            shard.clear_source(source, dp_rank);
+        }
+    }
+
+    /// Enable fresh observations after complete replay, or after discarding
+    /// incomplete replay and applying a new valid live batch to a clean source.
+    pub fn resume_source(&self, source: &SourceId, dp_rank: u32) {
+        self.source_generation.fetch_add(1, Ordering::AcqRel);
+        self.suspended_sources.remove(&(source.clone(), dp_rank));
+    }
+
     pub fn find_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
-        self.shard(query.group_idx).find_matches(query)
+        let generation = self.source_generation.load(Ordering::Acquire);
+        let matches = self.shard(query.group_idx).find_matches(query);
+        let matches = matches
+            .into_iter()
+            .filter(|hit| {
+                !self
+                    .suspended_sources
+                    .contains_key(&(hit.target.instance_id.clone(), hit.target.dp_rank))
+            })
+            .collect();
+        if self.source_generation.load(Ordering::Acquire) != generation {
+            return Vec::new();
+        }
+        matches
     }
 }
 
@@ -506,7 +598,7 @@ impl Default for KvBlockIndexer {
     }
 }
 
-impl crate::kv_index::TieredMatchProvider for KvBlockIndexer {
+impl crate::policies::TieredMatchProvider for KvBlockIndexer {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
         self.find_matches(query)
     }
@@ -563,11 +655,96 @@ mod tests {
         Arc::<str>::from(s)
     }
 
-    fn depth_of(res: &[TierMatch], target_id: &str, tier: StorageTier) -> u32 {
+    #[test]
+    fn source_suspension_and_invalidation_cover_tiers_groups_and_only_that_rank() {
+        let idx = KvBlockIndexer::new();
+        let tiers = [
+            StorageTier::Device,
+            StorageTier::HostPinned,
+            StorageTier::External,
+        ];
+        for group in [0, 1] {
+            for (owner, tier, seq) in [
+                (worker("a"), StorageTier::Device, "a-gpu"),
+                (worker("a"), StorageTier::HostPinned, "a-cpu"),
+                (pool("shared", "a"), StorageTier::External, "a-pool"),
+                (worker_rank("a", 1), StorageTier::Device, "a-rank1"),
+                (pool("shared", "b"), StorageTier::External, "b-pool"),
+            ] {
+                idx.store(group, owner, tier, None, &[(h(seq), h("x"))]);
+            }
+            assert_eq!(
+                idx.find_matches(&query_group(group, &["x"], &tiers)).len(),
+                5
+            );
+        }
+        let source = SourceId::from("a");
+        idx.suspend_source(&source, 0);
+        for group in [0, 1] {
+            let hits = idx.find_matches(&query_group(group, &["x"], &tiers));
+            assert_eq!(hits.len(), 2);
+            assert!(hits
+                .iter()
+                .all(|hit| hit.target.instance_id != source || hit.target.dp_rank != 0));
+        }
+        // Complete replay may resume credit without forgetting still-valid claims.
+        idx.resume_source(&source, 0);
+        assert_eq!(idx.find_matches(&query(&["x"], &tiers)).len(), 5);
+        idx.invalidate_source(&source, 0);
+        idx.resume_source(&source, 0);
+        for group in [0, 1] {
+            assert_eq!(
+                idx.find_matches(&query_group(group, &["x"], &tiers)).len(),
+                2
+            );
+        }
+        // Only a fresh store can restore a cleared observation.
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("fresh"), h("y"))],
+        );
+        assert_eq!(idx.find_matches(&query(&["y"], &tiers)).len(), 1);
+        assert_eq!(idx.find_matches(&query(&["x"], &tiers)).len(), 2);
+    }
+
+    #[test]
+    fn query_discards_snapshot_crossing_invalidation_and_resume() {
+        let idx = Arc::new(KvBlockIndexer::new());
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("s"), h("x"))],
+        );
+        let invalidating = idx.clone();
+        AFTER_QUERY_EDGE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let source = SourceId::from("a");
+                invalidating.invalidate_source(&source, 0);
+                invalidating.resume_source(&source, 0);
+            }));
+        });
+        assert!(idx
+            .find_matches(&query(&["x"], &[StorageTier::Device]))
+            .is_empty());
+    }
+
+    fn segments_of(res: &[TierMatch], target_id: &str, tier: StorageTier) -> Vec<(u32, u32)> {
         res.iter()
             .find(|m| &*m.target.instance_id == target_id && m.tier == tier)
-            .map(|m| m.matched_depth)
-            .unwrap_or(0)
+            .map(|m| m.segments.clone())
+            .unwrap_or_default()
+    }
+
+    fn depth_of(res: &[TierMatch], target_id: &str, tier: StorageTier) -> u32 {
+        segments_of(res, target_id, tier)
+            .into_iter()
+            .find(|(start, _)| *start == 0)
+            .map_or(0, |(_, end)| end)
     }
 
     fn assert_observations(shard: &GroupShard, key: &OwnerTier, expected: &[&str]) {
@@ -930,7 +1107,7 @@ mod tests {
         let res = idx.find_matches(&query(&["h0", "h1", "h2", "h3"], &[StorageTier::Device]));
         assert_eq!(res.len(), 1);
         // h3 absent → match depth 3.
-        assert_eq!(depth_of(&res, "w0", StorageTier::Device), 3);
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 3)]);
     }
 
     #[test]
@@ -976,7 +1153,10 @@ mod tests {
         idx.remove(0, &worker("w0"), StorageTier::Device, &[h("h0")]);
         let res = idx.find_matches(&query(&["h0"], &[StorageTier::HostPinned]));
         assert_eq!(res.len(), 1);
-        assert_eq!(depth_of(&res, "w0", StorageTier::HostPinned), 1);
+        assert_eq!(
+            segments_of(&res, "w0", StorageTier::HostPinned),
+            vec![(0, 1)]
+        );
     }
 
     #[test]
@@ -987,7 +1167,7 @@ mod tests {
 
         // Request has h0,h1,h2 but only h0,h1 are resident → depth 2.
         let res = idx.find_matches(&query(&["h0", "h1", "h2"], &[StorageTier::Device]));
-        assert_eq!(depth_of(&res, "w0", StorageTier::Device), 2);
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 2)]);
     }
 
     #[test]
@@ -1001,7 +1181,7 @@ mod tests {
         idx.remove(0, &worker("w0"), StorageTier::Device, &[h("h1")]);
         // h0 still matched (depth 1); the query's h1 now finds no owner.
         let res = idx.find_matches(&query(&["h0", "h1"], &[StorageTier::Device]));
-        assert_eq!(depth_of(&res, "w0", StorageTier::Device), 1);
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 1)]);
     }
 
     #[test]
@@ -1034,7 +1214,12 @@ mod tests {
 
         idx.remove(0, &worker("w0"), StorageTier::Device, &[h("sb")]);
         let res = idx.find_matches(&query(&["a", "b", "c"], &[StorageTier::Device]));
-        assert_eq!(depth_of(&res, "w0", StorageTier::Device), 1);
+        // b removed mid-prefix: c survives as a separate segment. The cost
+        // model credits only [0, d_gpu); the index reports both.
+        assert_eq!(
+            segments_of(&res, "w0", StorageTier::Device),
+            vec![(0, 1), (2, 3)]
+        );
 
         idx.store(
             0,
@@ -1044,7 +1229,7 @@ mod tests {
             &[(h("sb"), h("b"))],
         );
         let res = idx.find_matches(&query(&["a", "b", "c"], &[StorageTier::Device]));
-        assert_eq!(depth_of(&res, "w0", StorageTier::Device), 3);
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 3)]);
     }
 
     #[test]
@@ -1068,8 +1253,8 @@ mod tests {
 
         let res = idx.find_matches(&query(&["h0", "h1", "h2", "h3"], &[StorageTier::Device]));
         assert_eq!(res.len(), 2);
-        assert_eq!(depth_of(&res, "w0", StorageTier::Device), 3);
-        assert_eq!(depth_of(&res, "w1", StorageTier::Device), 2);
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 3)]);
+        assert_eq!(segments_of(&res, "w1", StorageTier::Device), vec![(0, 2)]);
     }
 
     #[test]
@@ -1314,7 +1499,7 @@ mod tests {
         );
 
         let res = idx.find_matches(&query(&["a", "x", "b", "x", "c"], &[StorageTier::Device]));
-        assert_eq!(depth_of(&res, "w0", StorageTier::Device), 5);
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 5)]);
     }
 
     #[test]
@@ -1340,35 +1525,36 @@ mod tests {
         );
 
         assert_eq!(
-            depth_of(
+            segments_of(
                 &idx.find_matches(&query(&["h0", "h1", "h2", "h3"], &[StorageTier::Device])),
                 "w0",
                 StorageTier::Device
             ),
-            4
+            vec![(0, 4)]
         );
         assert_eq!(
-            depth_of(
+            segments_of(
                 &idx.find_matches(&query(&["h0", "h1", "h4"], &[StorageTier::Device])),
                 "w0",
                 StorageTier::Device
             ),
-            3
+            vec![(0, 3)]
         );
 
         idx.remove(0, &worker("w0"), StorageTier::Device, &[h("s2")]);
+        // h2 removed mid-prefix: h3 survives as a separate segment.
         assert_eq!(
-            depth_of(
+            segments_of(
                 &idx.find_matches(&query(&["h0", "h1", "h2", "h3"], &[StorageTier::Device])),
                 "w0",
                 StorageTier::Device
             ),
-            2
+            vec![(0, 2), (3, 4)]
         );
     }
 
     #[test]
-    fn store_resumes_from_registered_incoming_seq_after_full_and_partial_matches() {
+    fn store_resumes_from_incoming_alias_after_full_and_partial_matches() {
         for original in [
             vec![(h("sx"), h("x")), (h("sy"), h("y"))],
             vec![(h("sx"), h("x")), (h("sy"), h("y")), (h("sz"), h("z"))],
@@ -1388,24 +1574,31 @@ mod tests {
             );
 
             assert_eq!(
-                depth_of(
+                segments_of(
                     &shard.find_matches(&query(&["x", "y", "w"], &[StorageTier::Device])),
                     "w0",
                     StorageTier::Device,
                 ),
-                3
+                vec![(0, 3)]
             );
             assert_eq!(
-                depth_of(
+                segments_of(
                     &shard.find_matches(&query(&["x", "y", "z"], &[StorageTier::Device])),
                     "w0",
                     StorageTier::Device,
                 ),
-                original.len() as u32
+                vec![(0, original.len() as u32)]
             );
             assert!(shard.anchors.contains_key("incoming-x"));
             assert!(shard.anchors.contains_key("incoming-y"));
             assert!(!shard.root.read().children.contains_key("w"));
+            assert_eq!(
+                *shard
+                    .counts
+                    .get(&(worker("w0"), StorageTier::Device))
+                    .unwrap(),
+                original.len() + 3
+            );
             // Matching local hashes registers incoming observations alongside
             // the original identities, rather than only claiming stored keys.
             let mut expected: Vec<&str> = original
@@ -1444,14 +1637,22 @@ mod tests {
             expected.retain(|seq| *seq != "sy");
             assert_observations(&shard, &key, &expected);
             assert!(!y.read().claims[y_pos].contains(&key));
-            for hashes in [["x", "y", "w"], ["x", "y", "z"]] {
+            let expected_z_segments = if original.len() == 3 {
+                vec![(0, 1), (2, 3)]
+            } else {
+                vec![(0, 1)]
+            };
+            for (hashes, expected_segments) in [
+                (["x", "y", "w"], vec![(0, 1), (2, 3)]),
+                (["x", "y", "z"], expected_z_segments),
+            ] {
                 assert_eq!(
-                    depth_of(
+                    segments_of(
                         &shard.find_matches(&query(&hashes, &[StorageTier::Device])),
                         "w0",
                         StorageTier::Device,
                     ),
-                    1
+                    expected_segments
                 );
             }
         }
@@ -1618,12 +1819,16 @@ mod tests {
             (vec!["w"], 0),
         ] {
             assert_eq!(
-                depth_of(
+                segments_of(
                     &shard.find_matches(&query(&hashes, &[StorageTier::Device])),
                     "w0",
                     StorageTier::Device,
                 ),
-                expected,
+                if expected == 0 {
+                    vec![]
+                } else {
+                    vec![(0, expected)]
+                },
                 "query {hashes:?}"
             );
         }
@@ -1663,5 +1868,160 @@ mod tests {
         let ext = idx.find_matches(&query(&["h0"], &[StorageTier::External]));
         assert_eq!(ext.len(), 1);
         assert_eq!(&*ext[0].target.instance_id, "w0");
+    }
+
+    #[test]
+    fn device_plus_host_continuation_reports_both_tiers() {
+        // Device holds [0,3) and host holds [3,10) as a parent-chained tail:
+        // host lacks block 0 yet the engine reuses the 7-block tail, so the
+        // index reports each tier's held intervals.
+        let idx = KvBlockIndexer::new();
+        idx.store(
+            0,
+            worker("w0"),
+            StorageTier::Device,
+            None,
+            &[(h("s0"), h("h0")), (h("s1"), h("h1")), (h("s2"), h("h2"))],
+        );
+        idx.store(
+            0,
+            worker("w0"),
+            StorageTier::HostPinned,
+            Some(h("s2")),
+            &[
+                (h("s3"), h("h3")),
+                (h("s4"), h("h4")),
+                (h("s5"), h("h5")),
+                (h("s6"), h("h6")),
+                (h("s7"), h("h7")),
+                (h("s8"), h("h8")),
+                (h("s9"), h("h9")),
+            ],
+        );
+
+        let res = idx.find_matches(&query(
+            &["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8", "h9"],
+            &[StorageTier::Device, StorageTier::HostPinned],
+        ));
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 3)]);
+        assert_eq!(
+            segments_of(&res, "w0", StorageTier::HostPinned),
+            vec![(3, 10)]
+        );
+    }
+
+    #[test]
+    fn same_depth_multiple_owners_no_duplicate_segment() {
+        // Two pools push the same block to the same worker at the same tier:
+        // one (target, tier) at one depth must extend the segment by one, not
+        // once per owner — otherwise the run-length loop double-counts the
+        // depth into two identical segments.
+        let idx = KvBlockIndexer::new();
+        idx.store(
+            0,
+            pool("poolA", "w0"),
+            StorageTier::External,
+            None,
+            &[(h("s0"), h("h0"))],
+        );
+        idx.store(
+            0,
+            pool("poolB", "w0"),
+            StorageTier::External,
+            None,
+            &[(h("s0"), h("h0"))],
+        );
+
+        let res = idx.find_matches(&query(&["h0"], &[StorageTier::External]));
+        assert_eq!(segments_of(&res, "w0", StorageTier::External), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn same_depth_multiple_owners_prefer_local_copy() {
+        let idx = KvBlockIndexer::new();
+        let block = [(h("s0"), h("h0"))];
+        // Insert the remote claim first to ensure locality does not depend on
+        // the first owner accepted by the per-depth de-duplication guard.
+        idx.store(0, pool("poolA", "w0"), StorageTier::Device, None, &block);
+        idx.store(0, worker("w0"), StorageTier::Device, None, &block);
+
+        let res = idx.find_matches(&query(&["h0"], &[StorageTier::Device]));
+        let m = res
+            .iter()
+            .find(|m| &*m.target.instance_id == "w0" && m.tier == StorageTier::Device)
+            .expect("matching target and tier");
+        assert_eq!(m.segments, vec![(0, 1)]);
+        assert_eq!(m.locality, Locality::Local);
+    }
+
+    #[test]
+    fn partial_edge_match_does_not_descend_into_misaligned_child() {
+        // [a,b,c] edge with a Host child x; query [a,x] diverges at b, so the
+        // walk must stop at a — x is at tree position 3, not query position 1.
+        let idx = KvBlockIndexer::new();
+        idx.store(
+            0,
+            worker("w0"),
+            StorageTier::Device,
+            None,
+            &[(h("sa"), h("a")), (h("sb"), h("b")), (h("sc"), h("c"))],
+        );
+        idx.store(
+            0,
+            worker("w0"),
+            StorageTier::HostPinned,
+            Some(h("sc")),
+            &[(h("sx"), h("x"))],
+        );
+
+        let res = idx.find_matches(&query(
+            &["a", "x"],
+            &[StorageTier::Device, StorageTier::HostPinned],
+        ));
+        assert_eq!(segments_of(&res, "w0", StorageTier::Device), vec![(0, 1)]);
+        assert!(segments_of(&res, "w0", StorageTier::HostPinned).is_empty());
+    }
+
+    #[test]
+    fn query_split_between_edges_preserves_position_and_tier() {
+        let idx = Arc::new(KvBlockIndexer::new());
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::Device,
+            None,
+            &[(h("s0"), h("x")), (h("s1"), h("y"))],
+        );
+        // Repeating token-local hashes at different chain positions is legal.
+        idx.store(
+            0,
+            worker("a"),
+            StorageTier::HostPinned,
+            Some(h("s1")),
+            &[(h("s2"), h("y"))],
+        );
+        let splitting = idx.clone();
+        AFTER_QUERY_EDGE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Another owner's store splits the edge after query matched it.
+                // Neither the local path nor A's residency changes.
+                splitting.store(
+                    0,
+                    worker("b"),
+                    StorageTier::Device,
+                    None,
+                    &[(h("b0"), h("x"))],
+                );
+            }));
+        });
+        let hits = idx.find_matches(&query(
+            &["x", "y", "y"],
+            &[StorageTier::Device, StorageTier::HostPinned],
+        ));
+        assert_eq!(segments_of(&hits, "a", StorageTier::Device), vec![(0, 2)]);
+        assert_eq!(
+            segments_of(&hits, "a", StorageTier::HostPinned),
+            vec![(2, 3)]
+        );
     }
 }
