@@ -10,18 +10,6 @@ use vllm_tokenizer::Tokenizer;
 
 use crate::protocols::spec::{CompletionRequest, PromptInput};
 
-/// Request-owned input tokens, borrowed by policy and reused across retries.
-#[derive(Debug)]
-pub struct PreparedCompletion {
-    token_ids: Vec<u32>,
-}
-
-impl PreparedCompletion {
-    pub fn token_ids(&self) -> &[u32] {
-        &self.token_ids
-    }
-}
-
 /// Distinguishes an ineligible optimization from invalid input or service failure.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompletionPreparationError {
@@ -68,11 +56,13 @@ pub fn validate_completion_tokenizer_definition(definition: &Value) -> Result<()
 /// vocabulary, which may exceed the tokenizer vocabulary. Unsupported input
 /// modifiers fail closed; typed sampling/output fields are left untouched.
 /// Empty encoded input is rejected rather than treated as a positive prefix.
+/// This diagnostic adapter preserves error text but discards error categories;
+/// routing fallback decisions must use [`prepare_completion_classified`].
 pub fn prepare_completion(
     request: &CompletionRequest,
     tokenizer: &dyn Tokenizer,
     model_vocab_size: u32,
-) -> Result<PreparedCompletion, String> {
+) -> Result<Vec<u32>, String> {
     prepare_completion_classified(request, tokenizer, model_vocab_size)
         .map_err(|error| error.to_string())
 }
@@ -87,7 +77,7 @@ pub fn prepare_completion_classified(
     request: &CompletionRequest,
     tokenizer: &dyn Tokenizer,
     model_vocab_size: u32,
-) -> Result<PreparedCompletion, CompletionPreparationError> {
+) -> Result<Vec<u32>, CompletionPreparationError> {
     use CompletionPreparationError::{InvalidRequest, ServiceFailure, Unsupported};
 
     if model_vocab_size == 0 {
@@ -166,7 +156,7 @@ pub fn prepare_completion_classified(
             "completion preparation requires nonempty token input".into(),
         ));
     }
-    Ok(PreparedCompletion { token_ids })
+    Ok(token_ids)
 }
 
 fn validate_prompt_ids(
