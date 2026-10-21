@@ -975,23 +975,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dense_source_block_size_mismatch_discovered_16_8() {
-        check_dense_source_block_size(16, 8, false).await;
-    }
-
-    #[tokio::test]
-    async fn dense_source_block_size_mismatch_discovered_8_16() {
-        check_dense_source_block_size(8, 16, false).await;
-    }
-
-    #[tokio::test]
-    async fn dense_source_block_size_mismatch_static_16_8() {
-        check_dense_source_block_size(16, 8, true).await;
-    }
-
-    #[tokio::test]
-    async fn dense_source_block_size_mismatch_static_8_16() {
-        check_dense_source_block_size(8, 16, true).await;
+    async fn dense_source_block_size_mismatch_revokes_only_affected_source() {
+        for (expected, actual) in [(16, 8), (8, 16)] {
+            for use_static in [false, true] {
+                check_dense_source_block_size(expected, actual, use_static).await;
+            }
+        }
     }
 
     async fn check_dense_source_block_size(expected: u32, actual: u32, use_static: bool) {
