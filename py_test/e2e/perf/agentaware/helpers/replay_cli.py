@@ -7,7 +7,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .case_config import RouterReplayE2EConfig
+from _siblings import import_sibling_module
+
+RouterReplayE2EConfig = import_sibling_module("case_config").RouterReplayE2EConfig
 
 _REPLAY_CLI_FLAGS: tuple[tuple[str, str], ...] = (
     ("endpoint", "--endpoint"),

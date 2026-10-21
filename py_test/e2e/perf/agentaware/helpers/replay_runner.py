@@ -10,8 +10,13 @@ from pathlib import Path
 from helpers.paths import repo_root
 from helpers.router_server import managed_router
 from helpers.server import managed_vllm
-from .case_config import RouterReplayE2EConfig
-from .replay_cli import build_replay_argv, build_replay_env
+from _siblings import import_sibling_module
+
+_case_config = import_sibling_module("case_config")
+_replay_cli = import_sibling_module("replay_cli")
+RouterReplayE2EConfig = _case_config.RouterReplayE2EConfig
+build_replay_argv = _replay_cli.build_replay_argv
+build_replay_env = _replay_cli.build_replay_env
 
 
 def run_router_replay(
