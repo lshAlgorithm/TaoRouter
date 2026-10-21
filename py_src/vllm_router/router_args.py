@@ -163,10 +163,11 @@ class RouterArgs:
                 "round_robin",
                 "cache_aware",
                 "kv_aware",
+                "trusted_kv_aware",
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Load balancing policy to use. kv_aware is supported only in regular mode. In PD mode, this is used for both prefill and decode unless overridden",
+            help="Load balancing policy to use. kv_aware and trusted_kv_aware are supported only in regular mode. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
@@ -179,7 +180,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for prefill nodes in PD mode. KV-aware policies are not supported in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
@@ -192,7 +193,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for decode nodes in PD mode. KV-aware policies are not supported in PD mode. If not specified, uses the main policy",
         )
 
         parser.add_argument(
@@ -607,12 +608,13 @@ class RouterArgs:
 
             effective_prefill_policy = self.prefill_policy or self.policy
             effective_decode_policy = self.decode_policy or self.policy
-            if "kv_aware" in (
-                effective_prefill_policy,
-                effective_decode_policy,
-            ):
+            if self.policy == "trusted_kv_aware" or {
+                "kv_aware",
+                "trusted_kv_aware",
+            }.intersection((effective_prefill_policy, effective_decode_policy)):
                 raise ValueError(
-                    "kv_aware is supported only in regular mode, not PD disaggregation"
+                    "kv_aware is supported only in regular mode, not PD disaggregation; "
+                    "trusted_kv_aware has the same restriction"
                 )
 
             # Warn about policy usage in PD mode
@@ -659,7 +661,6 @@ class RouterArgs:
 
         prefill_urls = []
         for prefill_args in prefill_list:
-
             url = prefill_args[0]
 
             # Handle optional bootstrap port

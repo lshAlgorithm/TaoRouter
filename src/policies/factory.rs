@@ -15,6 +15,9 @@ impl PolicyFactory {
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
+            PolicyConfig::TrustedKvAware { config } => {
+                Arc::new(super::TrustedKvAwarePolicy::with_config(config.clone()))
+            }
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
@@ -61,6 +64,7 @@ impl PolicyFactory {
     /// Create a policy by name (for dynamic loading)
     pub fn create_by_name(name: &str) -> Option<Arc<dyn LoadBalancingPolicy>> {
         match name.to_lowercase().as_str() {
+            "trusted_kv_aware" => Some(Arc::new(super::TrustedKvAwarePolicy::default())),
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
@@ -76,6 +80,44 @@ impl PolicyFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kv_policy_modes_keep_distinct_capabilities() {
+        for (name, trusted) in [("kv_aware", false), ("trusted_kv_aware", true)] {
+            let config: PolicyConfig =
+                serde_json::from_value(serde_json::json!({"type": name})).unwrap();
+            assert_eq!(config.name(), name);
+            let policy = PolicyFactory::create_from_config(&config);
+            assert_eq!(policy.name(), name);
+            assert_eq!(
+                policy.as_any().is::<super::super::TrustedKvAwarePolicy>(),
+                trusted
+            );
+            assert_eq!(
+                super::super::kv_aware_ops(policy.as_ref()).is_some(),
+                !trusted
+            );
+            assert_eq!(PolicyFactory::create_by_name(name).unwrap().name(), name);
+        }
+    }
+
+    #[test]
+    fn test_trusted_limits_do_not_replace_upstream_cost_parameters() {
+        let policy: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "kv_aware", "router_temperature": 0.25, "kv_penalty_host": 0.6
+        }))
+        .unwrap();
+        assert!(matches!(policy, PolicyConfig::KvAware {
+            router_temperature, kv_penalty_host, ..
+        } if router_temperature == 0.25 && kv_penalty_host == 0.6));
+
+        let policy: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "type": "trusted_kv_aware", "cache_weight": 0.75, "max_sources": 32
+        }))
+        .unwrap();
+        assert!(matches!(policy, PolicyConfig::TrustedKvAware { config }
+            if config.cache_weight == 0.75 && config.max_sources == 32));
+    }
 
     #[test]
     fn test_create_from_config() {

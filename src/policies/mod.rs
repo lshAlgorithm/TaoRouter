@@ -18,6 +18,7 @@ mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+pub(crate) mod trusted_kv_aware;
 
 pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
@@ -34,6 +35,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use trusted_kv_aware::TrustedKvAwarePolicy;
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value

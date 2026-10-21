@@ -431,6 +431,17 @@ class TestRouterArgs:
         )
         args._validate_router_args()
 
+    def test_trusted_mode_rejects_pd_even_when_stages_override_main_policy(self):
+        args = RouterArgs(
+            vllm_pd_disaggregation=True,
+            service_discovery=True,
+            policy="trusted_kv_aware",
+            prefill_policy="round_robin",
+            decode_policy="consistent_hash",
+        )
+        with pytest.raises(ValueError, match="only in regular mode"):
+            args._validate_router_args()
+
 
 class TestPolicyFromStr:
     """Test policy string to enum conversion."""
@@ -454,6 +465,16 @@ class TestPolicyFromStr:
 
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
+
+    def test_kv_policy_reaches_the_native_binding(self):
+        from vllm_router_rs import PolicyType, Router
+
+        args = parse_router_args(["--policy", "trusted_kv_aware"])
+        assert args.policy == "trusted_kv_aware"
+        assert policy_from_str(args.policy) == PolicyType.TrustedKvAware
+        assert isinstance(
+            Router(worker_urls=[], policy=PolicyType.TrustedKvAware), Router
+        )
 
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""

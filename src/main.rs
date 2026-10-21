@@ -119,9 +119,22 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    /// Load balancing policy to use. kv_aware is supported only in regular mode, not PD disaggregation.
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Load balancing policy to use. kv_aware and trusted_kv_aware are supported only in regular mode, not PD disaggregation.
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "trusted_kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
+
+    /// Weight of verified cache overlap versus active load (0..1).
+    #[arg(long, default_value_t = 0.5)]
+    kv_cache_weight: f64,
+    /// Maximum age of a verified publisher observation.
+    #[arg(long, default_value_t = 30)]
+    kv_max_event_age_secs: u64,
+    /// Maximum number of subscribed worker/rank sources.
+    #[arg(long, default_value_t = 1024)]
+    kv_max_sources: usize,
+    /// Conservative global budget of indexed block announcements.
+    #[arg(long, default_value_t = 65_536)]
+    kv_max_blocks: usize,
 
     /// Enable Program-level scheduling independently of the request-level
     /// load-balancing policy.
@@ -146,11 +159,11 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode.
+    /// Specific policy for prefill nodes in PD mode. kv_aware and trusted_kv_aware are not supported in PD mode.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
-    /// Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode.
+    /// Specific policy for decode nodes in PD mode. kv_aware and trusted_kv_aware are not supported in PD mode.
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     decode_policy: Option<String>,
 
@@ -411,6 +424,14 @@ impl CliArgs {
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
+            "trusted_kv_aware" => PolicyConfig::TrustedKvAware {
+                config: vllm_router_rs::config::TrustedKvAwareConfig {
+                    cache_weight: self.kv_cache_weight,
+                    max_event_age_secs: self.kv_max_event_age_secs,
+                    max_sources: self.kv_max_sources,
+                    max_blocks: self.kv_max_blocks,
+                },
+            },
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
@@ -794,6 +815,32 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_kv_policy_and_resource_limits() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "trusted_kv_aware",
+            "--kv-cache-weight",
+            "0.75",
+            "--kv-max-event-age-secs",
+            "12",
+            "--kv-max-sources",
+            "16",
+            "--kv-max-blocks",
+            "2048",
+        ])
+        .unwrap();
+        let PolicyConfig::TrustedKvAware { config } = args.parse_policy(&args.policy) else {
+            panic!("expected trusted_kv_aware")
+        };
+        assert_eq!(config.cache_weight, 0.75);
+        assert_eq!(config.max_event_age_secs, 12);
+        assert_eq!(config.max_sources, 16);
+        assert_eq!(config.max_blocks, 2048);
+        config.validate().unwrap();
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {

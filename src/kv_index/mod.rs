@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 pub mod discovery;
 mod endpoints;
 pub mod indexer;
+pub mod routing;
+pub mod runtime;
 pub mod subscriber;
 pub mod types;
 pub mod wire;
