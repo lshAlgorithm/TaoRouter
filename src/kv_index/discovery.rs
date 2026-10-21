@@ -314,17 +314,22 @@ impl KvIndexSupervisor {
                 topic: entry.topic.clone(),
                 hwm: entry.hwm,
             };
-            let spawn = if self.dense_http {
-                crate::kv_index::subscriber::spawn_dense
+            let handle = if self.dense_http {
+                crate::kv_index::subscriber::spawn_dense(
+                    ev,
+                    indexer.clone(),
+                    Some(self.signal_tx.clone()),
+                    self.ctx.clone(),
+                    key.block_size,
+                )
             } else {
-                spawn_subscriber
+                spawn_subscriber(
+                    ev,
+                    indexer.clone(),
+                    Some(self.signal_tx.clone()),
+                    self.ctx.clone(),
+                )
             };
-            let handle = spawn(
-                ev,
-                indexer.clone(),
-                Some(self.signal_tx.clone()),
-                self.ctx.clone(),
-            );
             info!(
                 "kv_index {}: spawned subscriber rank{} (instance {})",
                 worker_url, rank, instance_id
@@ -970,12 +975,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dense_source_block_size_mismatch_discovered_16_8() {
+        check_dense_source_block_size(16, 8, false).await;
+    }
+
+    #[tokio::test]
+    async fn dense_source_block_size_mismatch_discovered_8_16() {
+        check_dense_source_block_size(8, 16, false).await;
+    }
+
+    #[tokio::test]
+    async fn dense_source_block_size_mismatch_static_16_8() {
+        check_dense_source_block_size(16, 8, true).await;
+    }
+
+    #[tokio::test]
+    async fn dense_source_block_size_mismatch_static_8_16() {
+        check_dense_source_block_size(8, 16, true).await;
+    }
+
+    async fn check_dense_source_block_size(expected: u32, actual: u32, use_static: bool) {
+        use crate::kv_index::{MatchQuery, StorageTier};
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let (mut supervisor, mut signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        // Static Regular and the discovered Dense consumer share this admission.
+        supervisor.dense_http = true;
+        let rank = if use_static { 0 } else { 3 };
+        let (worker, http_task) = if use_static {
+            let worker = "http://127.0.0.1:1".to_string();
+            supervisor.static_sources = parse_static_sources(
+                &json!({&worker: {
+                    "endpoints": [endpoint], "block_size": expected,
+                    "model": "dense-model", "topic": "kv/dense"
+                }})
+                .to_string(),
+                std::slice::from_ref(&worker),
+            )
+            .unwrap();
+            (worker, None)
+        } else {
+            let sources = json!({(rank.to_string()): {
+                "endpoint": endpoint, "topic": "kv/dense", "publisher": "zmq",
+                "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
+            }});
+            let app = Router::new()
+                .route("/get_server_info", get(move || async move { Json(json!({
+                    "model_id": "dense-model", "instance_id": "dense-boot", "kv_block_size": expected
+                })) }))
+                .route("/kv_event_sources", get(move || {
+                    let sources = sources.clone();
+                    async move { Json(sources) }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (worker, Some(task))
+        };
+        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert_eq!(info.cache_key.as_ref().unwrap().block_size, expected);
+        assert_eq!(info.ranks, [rank]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match publisher.recv_bytes(zmq::DONTWAIT) {
+                    Ok(frame) => {
+                        assert_eq!(frame, b"\x01kv/dense");
+                        break;
+                    }
+                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                    Err(error) => panic!("XPUB subscription: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let indexer = supervisor
+            .workers
+            .lock()
+            .get(&worker)
+            .unwrap()
+            .indexer
+            .clone();
+        let old_tokens: Vec<u32> = (0..expected).collect();
+        let new_tokens: Vec<u32> = (100..100 + actual).collect();
+        let query = |tokens: &[u32]| MatchQuery {
+            group_idx: 0,
+            local_hashes: crate::kv_index::local_block_hash_strings(tokens, expected, None),
+            tiers_of_interest: vec![StorageTier::Device, StorageTier::HostPinned],
+        };
+        let mut neighbors = Vec::new();
+        for (source, neighbor_rank, topic) in [
+            ("other-source", rank, "kv/other-source"),
+            (info.instance_id.as_str(), rank + 1, "kv/other-rank"),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            neighbors.push(crate::kv_index::subscriber::spawn(
+                EventSource {
+                    source: Arc::from(source),
+                    dp_rank: neighbor_rank,
+                    pub_endpoint: publisher.get_last_endpoint().unwrap().unwrap(),
+                    replay_endpoint: None,
+                    topic: topic.into(),
+                    hwm: None,
+                },
+                indexer.clone(),
+                Some(tx),
+                Arc::new(zmq::Context::new()),
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match publisher.recv_bytes(zmq::DONTWAIT) {
+                        Ok(frame) => {
+                            assert_eq!(&frame[1..], topic.as_bytes());
+                            break;
+                        }
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("XPUB neighbor subscription: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let payload = rmp_serde::to_vec(&(
+                1.0,
+                [json!({
+                    "type": "BlockStored", "block_hashes": [70], "parent_block_hash": null,
+                    "token_ids": old_tokens, "block_size": expected, "medium": "GPU",
+                    "lora_id": null, "lora_name": null
+                })],
+                neighbor_rank,
+            ))
+            .unwrap();
+            assert!(crate::kv_index::decode_batch(&payload).is_ok());
+            publisher
+                .send_multipart([topic.as_bytes(), &0i64.to_be_bytes(), &payload], 0)
+                .unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap(),
+                Some(IngestionSignal::Advance { last_seq: 0, .. })
+            ));
+        }
+        let source_hits = |tokens: &[u32]| {
+            indexer
+                .find_matches(&query(tokens))
+                .into_iter()
+                .filter(|hit| {
+                    hit.target.instance_id.as_ref() == info.instance_id
+                        && hit.target.dp_rank == rank
+                })
+                .collect::<Vec<_>>()
+        };
+        for (seq, block_size, tokens) in [(0i64, expected, &old_tokens), (1, actual, &new_tokens)] {
+            let payload = rmp_serde::to_vec(&(
+                1.0,
+                [json!({
+                    "type": "BlockStored", "block_hashes": [seq + 7], "parent_block_hash": null,
+                    "token_ids": tokens, "block_size": block_size, "lora_id": null,
+                    "lora_name": null, "medium": if use_static { "GPU" } else { "CPU" }
+                })],
+                rank,
+            ))
+            .unwrap();
+            publisher
+                .send_multipart([b"kv/dense".as_slice(), &seq.to_be_bytes(), &payload], 0)
+                .unwrap();
+            if seq == 0 {
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(5), signals.recv())
+                        .await
+                        .unwrap(),
+                    Some(IngestionSignal::Advance { last_seq: 0, .. })
+                ));
+                let hits = source_hits(&old_tokens);
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].segments, [(0, 1)]);
+                assert_eq!(hits[0].target.dp_rank, rank);
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if source_hits(&old_tokens).is_empty() {
+                            assert!(indexer.find_matches(&query(&new_tokens)).is_empty());
+                            let remaining = indexer.find_matches(&query(&old_tokens));
+                            assert_eq!(remaining.len(), 2, "mismatch invalidated another source/rank");
+                            assert!(remaining.iter().all(|hit| hit.segments == [(0, 1)]));
+                            break;
+                        }
+                        if let Ok(signal) = signals.try_recv() {
+                            if matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }) {
+                                use crate::policies::{cost_components, CandidateView, CostParams};
+                                let hits = indexer.find_matches(&query(&new_tokens));
+                                for hit in &hits {
+                                    let cost = cost_components(&CandidateView {
+                                        target: &hit.target, matches: std::slice::from_ref(hit),
+                                        load: Default::default(), input_tokens: new_tokens.len(),
+                                    }, &CostParams { block_size: expected, ..Default::default() });
+                                    eprintln!("source={expected} event={actual} tier={:?} segments={:?} input_tokens={} ptoken={}",
+                                        hit.tier, hit.segments, new_tokens.len(), cost.ptoken);
+                                }
+                            }
+                            assert!(!matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }),
+                                "accepted mismatched Dense batch: source={expected}, event={actual}, static={use_static}, old={:?}, mismatched={:?}",
+                                indexer.find_matches(&query(&old_tokens)),
+                                indexer.find_matches(&query(&new_tokens)));
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("mismatch must revoke the previously indexed source");
+            }
+        }
+        supervisor.shutdown();
+        drop(neighbors);
+        if let Some(task) = http_task {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn http_and_static_sources_ingest_nonempty_topics_through_live_zmq() {
         use crate::kv_index::{MatchQuery, StorageTier};
         use axum::{routing::get, Json, Router};
         use serde_json::json;
 
-        for use_static in [false, true] {
+        for (use_static, block_size) in [
+            (false, 8u32),
+            (false, 16),
+            (false, 32),
+            (true, 8),
+            (true, 16),
+            (true, 32),
+        ] {
             let context = zmq::Context::new();
             let publisher = context.socket(zmq::XPUB).unwrap();
             publisher.bind("tcp://127.0.0.1:*").unwrap();
@@ -987,7 +1223,7 @@ mod tests {
                 let worker = "http://127.0.0.1:1".to_string();
                 let value = json!({
                     &worker: {
-                        "endpoints": [endpoint], "block_size": 16,
+                        "endpoints": [endpoint], "block_size": block_size,
                         "model": "served-alias", "topic": "kv/served-alias", "hwm": 128
                     }
                 })
@@ -1003,8 +1239,8 @@ mod tests {
                     "enable_kv_cache_events": true
                 }});
                 let app = Router::new()
-                    .route("/get_server_info", get(|| async { Json(json!({
-                        "model_id": "served-alias", "instance_id": "observed-boot", "kv_block_size": 16
+                    .route("/get_server_info", get(move || async move { Json(json!({
+                        "model_id": "served-alias", "instance_id": "observed-boot", "kv_block_size": block_size
                     })) }))
                     .route("/kv_event_sources", get(move || {
                         let sources = sources.clone();
@@ -1035,10 +1271,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(&subscription, b"\x01kv/served-alias");
-            let tokens: Vec<u32> = (0..16).collect();
+            let tokens: Vec<u32> = (0..block_size).collect();
             let event = json!({
                 "type": "BlockStored", "block_hashes": [7], "parent_block_hash": null,
-                "token_ids": tokens, "block_size": 16, "lora_id": null, "lora_name": null,
+                "token_ids": tokens, "block_size": block_size, "lora_id": null, "lora_name": null,
                 "medium": if use_static { "GPU" } else { "CPU" }
             });
             let payload = rmp_serde::to_vec(&(1.0, [event], rank)).unwrap();
@@ -1069,7 +1305,7 @@ mod tests {
                 .clone();
             let hits = indexer.find_matches(&MatchQuery {
                 group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(&tokens, 16, None),
+                local_hashes: crate::kv_index::local_block_hash_strings(&tokens, block_size, None),
                 tiers_of_interest: vec![tier],
             });
             assert_eq!(hits.len(), 1, "use_static={use_static}");
