@@ -5,9 +5,15 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
+
+# Shared E2E helpers (`py_test/e2e/helpers`); required for agentaware perf imports under pytest.
+_E2E_DIR = Path(__file__).resolve().parents[1]
+if str(_E2E_DIR) not in sys.path:
+    sys.path.insert(0, str(_E2E_DIR))
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

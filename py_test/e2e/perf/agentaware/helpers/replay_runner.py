@@ -7,9 +7,9 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from ....helpers.paths import repo_root
-from ....helpers.router_server import managed_router
-from ....helpers.server import managed_vllm
+from helpers.paths import repo_root
+from helpers.router_server import managed_router
+from helpers.server import managed_vllm
 from .case_config import RouterReplayE2EConfig
 from .replay_cli import build_replay_argv, build_replay_env
 

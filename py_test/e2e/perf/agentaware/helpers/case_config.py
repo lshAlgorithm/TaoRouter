@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ....helpers.case_loader import (
+from helpers.case_loader import (
     BenchmarkCase,
     E2EConfig,
     PerfScenario,
@@ -27,8 +27,8 @@ from ....helpers.case_loader import (
     _repo_root,
     ensure_directory,
 )
-from ....helpers.paths import DEFAULT_ROUTER_BINARY, repo_root
-from ....helpers.router_server import RouterDeployConfig
+from helpers.paths import DEFAULT_ROUTER_BINARY, repo_root
+from helpers.router_server import RouterDeployConfig
 
 ROUTER_REPLAY_WORKLOAD = "router-replay"
 _LEGACY_ROUTER_BINARY = "/path/to/router/target/release/vllm-router"

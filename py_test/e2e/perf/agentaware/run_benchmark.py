@@ -4,13 +4,35 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
 
-from ...helpers.replay_run import validate_completed_run
-from .helpers.case_config import RouterReplayE2EConfig
-from .helpers.replay_runner import run_router_replay
+from helpers.replay_run import validate_completed_run
+
+_SUITE_HELPERS = Path(__file__).resolve().parent / "helpers"
+
+
+def _load_agentaware_helper(stem: str):
+    mod_name = f"_agentaware_{stem}"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    path = _SUITE_HELPERS / f"{stem}.py"
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load agentaware helper: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_case_config = _load_agentaware_helper("case_config")
+_replay_runner = _load_agentaware_helper("replay_runner")
+RouterReplayE2EConfig = _case_config.RouterReplayE2EConfig
+run_router_replay = _replay_runner.run_router_replay
 
 
 @pytest.mark.e2e_perf
