@@ -291,7 +291,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         return Err(anyhow!("vllm-chat produced empty token_ids"));
     }
     Ok(TokenizeOut {
-        token_ids: Arc::from(token_ids),
+        token_ids,
         adapt_ms,
         template_ms,
         encode_ms,
