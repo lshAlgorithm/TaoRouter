@@ -37,7 +37,8 @@ def _load_e2e_paths_module(root: Path):
 
 def _ensure_import_paths() -> Path:
     suite_dir = Path(__file__).resolve().parent
-    root = suite_dir.parents[4]
+    # suite_dir = .../py_test/e2e/perf/agentaware → repo root is three levels up
+    root = suite_dir.parents[3]
     for path in (root, suite_dir):
         entry = str(path)
         if entry not in sys.path:
