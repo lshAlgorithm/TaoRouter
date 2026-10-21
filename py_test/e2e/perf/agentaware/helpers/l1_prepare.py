@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -46,10 +47,14 @@ def _repo_root() -> Path:
 
 
 def _run_module(module: str, argv: list[str]) -> None:
+    from helpers.paths import calibration_subprocess_env, resolve_calibration_root
+
+    calib_root = resolve_calibration_root(required=True)
     completed = subprocess.run(
         [sys.executable, "-m", module, *argv],
         check=False,
-        cwd=_repo_root(),
+        cwd=calib_root,
+        env=calibration_subprocess_env(calib_root),
     )
     if completed.returncode != 0:
         raise RuntimeError(f"{module} exited with code {completed.returncode}")
@@ -137,7 +142,19 @@ def _write_program_jsons(
     print(f"  {binding_path}", flush=True)
 
 
+def _ensure_calibration_environment(args: argparse.Namespace) -> None:
+    if getattr(args, "agent_infer_root", None):
+        os.environ["AGENT_INFER_ROOT"] = str(
+            Path(args.agent_infer_root).expanduser().resolve()
+        )
+    from helpers.paths import ensure_repo_on_sys_path, resolve_calibration_root
+
+    ensure_repo_on_sys_path()
+    resolve_calibration_root(required=True)
+
+
 def bootstrap(args: argparse.Namespace) -> None:
+    _ensure_calibration_environment(args)
     repo = _repo_root()
     output_root = Path(args.output_root).expanduser()
     if not output_root.is_absolute():
@@ -193,16 +210,34 @@ def bootstrap(args: argparse.Namespace) -> None:
     finish_calibration(args.base_url.rstrip("/"), args.model)
 
 
-def parser() -> argparse.ArgumentParser:
+def _parse_positive_int(value: str) -> int:
     try:
-        from tools.calibration.common import parse_nonnegative_int, parse_positive_int
-    except ImportError as exc:
-        raise ImportError(
-            "L1 calibration requires AgentInfer tools.calibration. Clone agent-infer and set "
-            "AGENT_INFER_ROOT to that repository before running prepare_l1.py."
-        ) from exc
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
 
+
+def _parse_nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("expected a non-negative integer")
+    return parsed
+
+
+def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
+    value.add_argument(
+        "--agent-infer-root",
+        type=Path,
+        default=None,
+        help="Optional: use tools/calibration from an agent-infer source checkout instead of this repo",
+    )
     value.add_argument(
         "--serve-config-file",
         type=Path,
@@ -225,15 +260,15 @@ def parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_ROOT,
         help="Stable L1 directory for calibration + both program JSON files",
     )
-    value.add_argument("--data-parallel-rank", type=parse_nonnegative_int, default=0)
+    value.add_argument("--data-parallel-rank", type=_parse_nonnegative_int, default=0)
     value.add_argument(
         "--token-capacity-per-dp-rank",
-        type=parse_positive_int,
+        type=_parse_positive_int,
         default=None,
         help="KV token capacity for one DP rank; default: decode run_config observed_kv_capacity_tokens",
     )
     value.add_argument("--prompt-lengths", default=DEFAULT_PREFILL_LENGTHS)
-    value.add_argument("--prefill-repeats", type=parse_positive_int, default=2)
+    value.add_argument("--prefill-repeats", type=_parse_positive_int, default=2)
     value.add_argument(
         "--decode-batch-sizes",
         default=DEFAULT_DECODE_BATCH_SIZES,
@@ -242,8 +277,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--decode-context-lengths", default=DEFAULT_DECODE_CONTEXT_LENGTHS
     )
-    value.add_argument("--decode-output-tokens", type=parse_positive_int, default=128)
-    value.add_argument("--decode-repeats", type=parse_positive_int, default=1)
+    value.add_argument("--decode-output-tokens", type=_parse_positive_int, default=128)
+    value.add_argument("--decode-repeats", type=_parse_positive_int, default=1)
     value.add_argument(
         "--force",
         action="store_true",

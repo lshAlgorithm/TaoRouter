@@ -58,7 +58,7 @@ def _ensure_import_paths() -> Path:
             sys.path.insert(0, entry)
 
     paths_mod = _load_e2e_paths_module(root)
-    paths_mod.ensure_agent_infer_tools_on_path()
+    paths_mod.ensure_repo_on_sys_path()
     return paths_mod.repo_root()
 
 

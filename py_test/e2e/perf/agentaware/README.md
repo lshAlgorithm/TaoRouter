@@ -1,6 +1,6 @@
 # Agent-aware router trace replay performance E2E (`agentaware`)
 
-Cold vLLM serve, **vLLM Router** (program scheduling), then `vllm bench serve --agentinfer replay`.
+Cold vLLM serve, **vLLM Router** (program scheduling), then `vllm bench serve --agentinfer replay` (requires the **AgentInfer wheel** in the same venv as vLLM — see below).
 **One case JSON → one pytest run → one result directory**; **no in-test compare** between router arms.
 
 All commands assume the **vllm-router repository root** as the current working directory. Case JSON,
@@ -55,18 +55,20 @@ Edit [`configs/l1-serve.json`](configs/l1-serve.json) (model path and `serve_arg
 build Router (`cargo build --release`), then from the **vllm-router** repo root:
 
 ```bash
-# vLLM + AgentInfer bench live in your inference venv (not necessarily this repo's .venv)
-export AGENT_INFER_ROOT=/path/to/agent-infer   # for L1 tools.calibration only
-
+# Same venv as vLLM (needs httpx, numpy, prometheus-client for calibration)
 python py_test/e2e/perf/agentaware/prepare_l1.py \
   --serve-config-file py_test/e2e/perf/agentaware/configs/l1-serve.json \
   --output-root results/agentaware/l1
 ```
 
-| Variable | Purpose |
+L1 runs **`python -m tools.calibration.calibrate_prefill|decode`** from this router repo ([`tools/calibration/`](../../../../tools/calibration/) vendored from [agent-infer](https://github.com/openJiuwen-ai/agent-infer)). The AgentInfer **wheel only ships `agentinfer/`** and does not include `tools/`; you do **not** need a source checkout unless you pass **`--agent-infer-root`** / **`AGENT_INFER_ROOT`** to use upstream calibration instead.
+
+**Artifacts** (`calibration.json`, program JSON) land under **`results/agentaware/l1`** here.
+
+| Variable / flag | Purpose |
 | -------- | ------- |
-| `AGENT_INFER_ROOT` | AgentInfer clone root; required for L1 prefill/decode calibration modules |
 | `VLLM_ROUTER_BINARY` | Optional override for `router_params.binary` (default `target/release/vllm-router`) |
+| `AGENT_INFER_ROOT` / `--agent-infer-root` | Optional: use `tools/calibration` from an agent-infer git checkout |
 
 You may point `--serve-config-file` at a full agentaware case JSON instead; only `serve_env` /
 `server_params` (and optional timeouts) are used for L1.
