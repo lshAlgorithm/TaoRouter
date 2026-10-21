@@ -43,7 +43,7 @@ fn text_defaults_to_bos_and_honors_explicit_special_token_switch() {
         ),
     ] {
         let prepared = prepare_completion(&request(value), &tokenizer, MODEL_VOCAB_SIZE).unwrap();
-        assert_eq!(prepared.token_ids(), expected);
+        assert_eq!(prepared, expected);
     }
 }
 
@@ -61,7 +61,7 @@ fn text_preserves_literal_added_special_tokens_and_unicode() {
             MODEL_VOCAB_SIZE,
         )
         .unwrap();
-        assert_eq!(prepared.token_ids(), expected);
+        assert_eq!(prepared, expected);
     }
 }
 
@@ -107,7 +107,7 @@ fn token_ids_are_not_reencoded_or_limited_to_tokenizer_vocabulary() {
             MODEL_VOCAB_SIZE,
         )
         .unwrap();
-        assert_eq!(prepared.token_ids(), &[0, 2, 15]);
+        assert_eq!(prepared, &[0, 2, 15]);
     }
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
 }
@@ -136,7 +136,7 @@ fn empty_encoded_input_is_rejected_but_default_bos_is_retained() {
         MODEL_VOCAB_SIZE,
     )
     .unwrap();
-    assert_eq!(prepared.token_ids(), &[1]);
+    assert_eq!(prepared, &[1]);
     let mut empty_ids = request(json!({"prompt": [0]}));
     empty_ids.prompt = PromptInput::IntArray(vec![]);
     for request in [
@@ -218,7 +218,7 @@ fn tokenizer_definition_rejects_padding_truncation_and_malformed_formats() {
 }
 
 #[test]
-fn request_output_options_stay_immutable_and_retries_borrow_same_owned_tokens() {
+fn text_encodes_once_without_mutating_request_output_options() {
     let tokenizer = CountingTokenizer {
         inner: tokenizer(),
         encodes: AtomicUsize::new(0),
@@ -235,16 +235,13 @@ fn request_output_options_stay_immutable_and_retries_borrow_same_owned_tokens() 
     }));
     let before = serde_json::to_value(&request).unwrap();
     let prepared = prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap();
-    let first_attempt = prepared.token_ids();
-    let retry = prepared.token_ids();
-    assert_eq!(retry, &[1, 3, 4]);
-    assert!(std::ptr::eq(first_attempt.as_ptr(), retry.as_ptr()));
+    assert_eq!(prepared, &[1, 3, 4]);
     assert_eq!(serde_json::to_value(&request).unwrap(), before);
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 1);
 }
 
 #[test]
-fn classified_exact_preparation_preserves_the_legacy_api_and_input() {
+fn diagnostic_adapter_preserves_classified_tokens_error_text_and_input() {
     let tokenizer = tokenizer();
     for (value, expected) in [
         (json!({"prompt": "hello world"}), vec![1, 3, 4]),
@@ -261,12 +258,10 @@ fn classified_exact_preparation_preserves_the_legacy_api_and_input() {
         let before = serde_json::to_value(&request).unwrap();
         let prepared =
             prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap();
-        assert_eq!(prepared.token_ids(), expected);
+        assert_eq!(prepared, expected);
         assert_eq!(
-            prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE)
-                .unwrap()
-                .token_ids(),
-            prepared.token_ids(),
+            prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap(),
+            prepared,
         );
         assert_eq!(serde_json::to_value(&request).unwrap(), before);
     }
@@ -402,7 +397,7 @@ fn classified_empty_encoded_input_is_invalid_but_default_bos_is_exact() {
         MODEL_VOCAB_SIZE,
     )
     .unwrap();
-    assert_eq!(prepared.token_ids(), &[1]);
+    assert_eq!(prepared, &[1]);
     let error = prepare_completion_classified(
         &request(json!({"prompt": "", "add_special_tokens": false})),
         &tokenizer,
@@ -421,9 +416,7 @@ fn scheduling_priority_is_exact_but_unproved_extensions_are_fallbacks() {
     for priority in [i64::MIN, 0, i64::MAX] {
         let value = request(json!({"prompt": [3, 4], "priority": priority}));
         assert_eq!(
-            prepare_completion_classified(&value, &tokenizer, MODEL_VOCAB_SIZE)
-                .unwrap()
-                .token_ids(),
+            prepare_completion_classified(&value, &tokenizer, MODEL_VOCAB_SIZE).unwrap(),
             &[3, 4]
         );
     }

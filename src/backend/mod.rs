@@ -39,7 +39,7 @@ pub fn stages_enabled() -> bool {
 
 pub use completion::{
     prepare_completion, prepare_completion_classified, validate_completion_tokenizer_definition,
-    CompletionPreparationError, PreparedCompletion,
+    CompletionPreparationError,
 };
 pub use control::{
     get_grpc_model_info, get_grpc_server_info, model_info_json, openai_models_json,
