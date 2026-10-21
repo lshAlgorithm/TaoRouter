@@ -9,11 +9,30 @@ import subprocess
 import sys
 from pathlib import Path
 
-from helpers.l1_serve import build_l1_vllm_e2e_config, managed_vllm
-from helpers.program_scheduling_config import (
-    read_observed_kv_capacity_tokens,
-    write_program_scheduling_configs,
-)
+
+def _import_sibling_module(stem: str) -> object:
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    path = here / f"{stem}.py"
+    mod_name = f"_agentaware_{stem}"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load agentaware helper module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_l1_serve = _import_sibling_module("l1_serve")
+build_l1_vllm_e2e_config = _l1_serve.build_l1_vllm_e2e_config
+managed_vllm = _l1_serve.managed_vllm
+_psc = _import_sibling_module("program_scheduling_config")
+read_observed_kv_capacity_tokens = _psc.read_observed_kv_capacity_tokens
+write_program_scheduling_configs = _psc.write_program_scheduling_configs
 
 DEFAULT_OUTPUT_ROOT = Path("results/agentaware/l1")
 DEFAULT_PREFILL_LENGTHS = "1024,2048,4096,8192,16384,32768,65536"

@@ -35,11 +35,24 @@ def _load_e2e_paths_module(root: Path):
     return module
 
 
+def _load_l1_prepare_module(suite_dir: Path):
+    import importlib.util
+
+    path = suite_dir / "helpers" / "l1_prepare.py"
+    spec = importlib.util.spec_from_file_location("agentaware_l1_prepare", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load L1 prepare module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _ensure_import_paths() -> Path:
     suite_dir = Path(__file__).resolve().parent
     # suite_dir = .../py_test/e2e/perf/agentaware → repo root is three levels up
     root = suite_dir.parents[3]
-    for path in (root, suite_dir):
+    e2e_dir = root / "py_test" / "e2e"
+    for path in (root, e2e_dir):
         entry = str(path)
         if entry not in sys.path:
             sys.path.insert(0, entry)
@@ -72,18 +85,19 @@ def _print_next_steps(output_root: Path) -> None:
 
 
 def main() -> None:
+    suite_dir = Path(__file__).resolve().parent
     root = _ensure_import_paths()
     os.chdir(root)
-    from helpers.l1_prepare import bootstrap, parser as l1_parser
+    l1_prepare = _load_l1_prepare_module(suite_dir)
 
-    cli = l1_parser()
+    cli = l1_prepare.parser()
     cli.prog = Path(__file__).name
     cli.description = (
         "Start vLLM from a serve config, run prefill/decode calibration, write both program JSON files, "
         "then stop serve."
     )
     args = cli.parse_args()
-    bootstrap(args)
+    l1_prepare.bootstrap(args)
     _print_next_steps(Path(args.output_root))
 
 

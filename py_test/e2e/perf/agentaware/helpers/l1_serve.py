@@ -9,14 +9,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ....helpers.case_loader import (
+from helpers.case_loader import (
     BenchmarkCase,
     E2EConfig,
     PerfScenario,
     _parse_deploy_case,
     _repo_root,
 )
-from ....helpers.server import managed_vllm
+from helpers.server import managed_vllm
 
 _LOCAL_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "0.0.0.0", "::"})
 
