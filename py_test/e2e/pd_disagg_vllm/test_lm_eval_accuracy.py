@@ -216,7 +216,7 @@ def validate_accuracy(
 
     if expected_value is None:
         print_warning(
-            f"No expected baseline found for {model_name}. " "Cannot validate accuracy."
+            f"No expected baseline found for {model_name}. Cannot validate accuracy."
         )
         print_info(
             "If this is the first time testing this model, "

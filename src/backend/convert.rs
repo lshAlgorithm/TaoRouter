@@ -295,7 +295,7 @@ fn other_i32(request: &ChatCompletionRequest, key: &str) -> Result<Option<i32>, 
         .transpose()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

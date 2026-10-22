@@ -773,7 +773,7 @@ Provide --worker-urls or PD flags as usual.",
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

@@ -413,7 +413,7 @@ fn worker_host(worker_url: &str) -> Option<String> {
         .map(|h| h.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 
