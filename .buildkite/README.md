@@ -2,12 +2,19 @@
 
 This directory contains the Buildkite pipeline configurations for the vLLM Router project.
 
+Formatting, Clippy, Black, Ruff, and spelling are not Buildkite jobs. They run
+from [`.pre-commit-config.yaml`](../.pre-commit-config.yaml) locally and in the
+GitHub Actions `pre-commit` workflow:
+
+```bash
+pip install pre-commit && pre-commit install
+```
+
 ## Pipeline Files
 
 ### `pipeline.yml`
 Main CI/CD pipeline that runs on all commits and pull requests. Includes:
 
-- **Fast Checks**: Code formatting and linting (Rust, Python)
 - **Build**: Release builds for Rust binary and Python wheels
 - **Tests**: Comprehensive test suite (unit, integration, Python)
 - **P/D Disaggregation Test**: GPU-based integration test for prefill/decode disaggregation
@@ -140,12 +147,6 @@ bash ./run_accuracy_test.sh
 5. **Run locally**: Reproduce the issue with the same configuration
 
 ## Additional Pipeline Steps
-
-### Fast Checks
-Runs in parallel for quick feedback:
-- Rust format check (`cargo fmt`)
-- Clippy linting (`cargo clippy`)
-- Python format check (black, ruff)
 
 ### Build
 Creates release artifacts:

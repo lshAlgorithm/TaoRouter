@@ -47,7 +47,7 @@ Install from PyPI
 pip install vllm-router                                                                                                                                                        ```
 
 To build from source:
-```bash    
+```bash
 pip install setuptools-rust wheel build
 python -m build
 pip install dist/*.whl
