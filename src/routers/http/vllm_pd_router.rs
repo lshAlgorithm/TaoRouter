@@ -156,9 +156,15 @@ async fn finalize_decode_response(
     };
 
     if is_streaming {
+        let is_sse = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
         let stream = decode_response.bytes_stream();
-        // Encoded bytes cannot be parsed as SSE frames without decoding them.
-        let body = if reconcile_cache && !is_encoded {
+        // A streaming request can receive a non-SSE body. Rewrite only upstream
+        // event streams whose bytes are already decoded; forward all others.
+        let body = if reconcile_cache && is_sse && !is_encoded {
             Body::from_stream(pd_cached_tokens::rewrite_sse_stream(
                 stream,
                 cached,
@@ -3068,6 +3074,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalizer_forwards_non_sse_streaming_body_before_upstream_finishes() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        const PREFIX: &[u8] =
+            br#"{"usage":{"prompt_tokens_details":{"cached_tokens":99}},"choices":[]"#;
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for content_type in [
+                Some("application/json"),
+                Some("application/octet-stream"),
+                Some("text/plain"),
+                Some("text/event-streaming"),
+                None,
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (finish, ready_to_finish) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let bytes_read = socket.read(&mut request).await.unwrap();
+                    assert!(bytes_read > 0, "client closed before sending request");
+                    let mut headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n",
+                        PREFIX.len() + 1
+                    );
+                    if let Some(content_type) = content_type {
+                        headers.push_str(&format!("Content-Type: {content_type}\r\n"));
+                    }
+                    headers.push_str("\r\n");
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                    socket.write_all(PREFIX).await.unwrap();
+                    // Hold the final JSON byte until the downstream receives its prefix.
+                    ready_to_finish.await.unwrap();
+                    socket.write_all(b"}").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                });
+                let decode = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap()
+                    .get(format!("http://{address}/"))
+                    .send()
+                    .await
+                    .unwrap();
+                let response = timeout(
+                    Duration::from_secs(2),
+                    finalize_decode_response(decode, Some(&prefill), path, true, true),
+                )
+                .await
+                .expect("non-SSE streaming responses must return before EOF")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("content-type")
+                        .map(|v| v.to_str().unwrap()),
+                    content_type
+                );
+                let mut body = response.into_body().into_data_stream();
+                let mut prefix = Vec::new();
+                timeout(Duration::from_secs(2), async {
+                    while prefix.len() < PREFIX.len() {
+                        prefix.extend_from_slice(&body.next().await.unwrap().unwrap());
+                    }
+                })
+                .await
+                .expect("non-SSE bytes must be forwarded before the upstream finishes");
+                assert_eq!(
+                    prefix, PREFIX,
+                    "path: {path}, content type: {content_type:?}"
+                );
+                finish.send(()).unwrap();
+                let mut suffix = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    suffix.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(suffix, b"}");
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn finalizer_forwards_oversized_sse_without_truncating() {
         use futures_util::StreamExt;
 
@@ -3158,6 +3252,51 @@ mod tests {
             .await
             .unwrap();
         (response, server)
+    }
+
+    #[tokio::test]
+    async fn finalizer_rewrites_only_event_stream_media_type() {
+        let raw = b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":99}},\"choices\":[]}\n\ndata: [DONE]\n\n";
+        let prefill = json!({"usage":{"prompt_tokens_details":{"cached_tokens":4}}});
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            for (content_type, rewrite) in [
+                ("text/event-stream", true),
+                ("text/event-stream; charset=utf-8", true),
+                ("Text/Event-Stream; Charset=UTF-8", true),
+                ("application/json", false),
+                ("text/plain", false),
+                ("text/event-streaming", false),
+                ("application/octet-stream; name=text/event-stream", false),
+            ] {
+                let (decode, server) =
+                    mock_encoded_decode_response(StatusCode::OK, raw, content_type, "identity")
+                        .await;
+                let response = finalize_decode_response(decode, Some(&prefill), path, true, false)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["content-type"], content_type);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                if rewrite {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    let usage: Value = serde_json::from_str(
+                        text.lines().next().unwrap().strip_prefix("data: ").unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+                    assert!(text.ends_with("data: [DONE]\n\n"));
+                } else {
+                    assert_eq!(
+                        bytes.as_ref(),
+                        raw,
+                        "path: {path}, content type: {content_type}"
+                    );
+                }
+                server.abort();
+            }
+        }
     }
 
     #[tokio::test]
