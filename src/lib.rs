@@ -1,21 +1,27 @@
 use pyo3::prelude::*;
+pub mod backend;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
+pub mod kv_hash;
+pub mod kv_index;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;
 pub mod otel_trace;
 pub mod policies;
+pub mod program_scheduling;
 pub mod protocols;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+mod token_estimator;
 pub mod tokenizer;
 pub mod tree;
+pub mod wasm_middleware;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
@@ -24,6 +30,7 @@ pub enum PolicyType {
     Random,
     RoundRobin,
     CacheAware,
+    KvAware,
     PowerOfTwo,
     ConsistentHash,
 }
@@ -35,6 +42,10 @@ struct Router {
     port: u16,
     worker_urls: Vec<String>,
     policy: PolicyType,
+    router_temperature: f64,
+    kv_penalty_host: f64,
+    kv_penalty_external: f64,
+    kv_penalty_disk: f64,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -43,6 +54,9 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
+    wasm_middleware: Option<String>,
+    wasm_middleware_sha256: Option<String>,
+    wasm_middleware_routes: Vec<String>,
     intra_node_data_parallel_size: usize,
     api_key: Option<String>,
     api_key_validation_urls: Vec<String>,
@@ -97,6 +111,9 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
+    // Explicit Program-level scheduling feature switch and optional overrides.
+    enable_program_scheduling: bool,
+    program_scheduling_config_json: Option<String>,
 }
 
 impl Router {
@@ -117,6 +134,12 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
+                },
+                PolicyType::KvAware => ConfigPolicyConfig::KvAware {
+                    router_temperature: self.router_temperature,
+                    kv_penalty_host: self.kv_penalty_host,
+                    kv_penalty_external: self.kv_penalty_external,
+                    kv_penalty_disk: self.kv_penalty_disk,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value
@@ -176,6 +199,7 @@ impl Router {
         };
 
         Ok(config::RouterConfig {
+            epd: None,
             mode,
             policy,
             host: self.host.clone(),
@@ -237,6 +261,10 @@ impl Router {
                     });
                 }
             },
+            program_scheduling: config::ProgramSchedulingConfig::resolve(
+                self.enable_program_scheduling,
+                self.program_scheduling_config_json.as_deref(),
+            )?,
         })
     }
 }
@@ -310,6 +338,15 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        wasm_middleware = None,
+        wasm_middleware_sha256 = None,
+        wasm_middleware_routes = vec![],
+        enable_program_scheduling = false,
+        program_scheduling_config_json = None,
+        router_temperature = 0.0,
+        kv_penalty_host = 0.8,
+        kv_penalty_external = 0.6,
+        kv_penalty_disk = 0.3,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -372,12 +409,40 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        wasm_middleware: Option<String>,
+        wasm_middleware_sha256: Option<String>,
+        wasm_middleware_routes: Vec<String>,
+        enable_program_scheduling: bool,
+        program_scheduling_config_json: Option<String>,
+        router_temperature: f64,
+        kv_penalty_host: f64,
+        kv_penalty_external: f64,
+        kv_penalty_disk: f64,
     ) -> PyResult<Self> {
+        if wasm_middleware_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some()
+            && wasm_middleware
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_none()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "wasm_middleware_sha256 requires wasm_middleware",
+            ));
+        }
         Ok(Router {
             host,
             port,
             worker_urls,
             policy,
+            router_temperature,
+            kv_penalty_host,
+            kv_penalty_external,
+            kv_penalty_disk,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,
@@ -386,6 +451,10 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
+            wasm_middleware,
+            wasm_middleware_sha256,
+            wasm_middleware_routes,
+            enable_program_scheduling,
             intra_node_data_parallel_size,
             api_key,
             api_key_validation_urls,
@@ -433,6 +502,7 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             kv_connector,
+            program_scheduling_config_json,
         })
     }
 
@@ -488,11 +558,15 @@ impl Router {
                 port: self.port,
                 router_config,
                 max_payload_size: self.max_payload_size,
+                wasm_middleware: self.wasm_middleware.clone(),
+                wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+                wasm_middleware_routes: self.wasm_middleware_routes.clone(),
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+                pool_idle_timeout_secs: server::DEFAULT_POOL_IDLE_TIMEOUT_SECS,
                 request_id_headers: self.request_id_headers.clone(),
                 trace_config: if self.enable_trace {
                     Some(config::TraceConfig {
