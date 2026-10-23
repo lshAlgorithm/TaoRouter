@@ -5,6 +5,8 @@
 # machines this repo runs.
 #
 #   l4_4       EKS l4-k8s, 4x L4 (vllm.ci/gpu-pool=l4x4). 4 GPU = 40 CPU / 160Gi / 96Gi shm.
+#              Image is the router CI image pushed by image-build:
+#              public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
 #   mi300_2    router_rocm_mi300_2, same-host xGMI via the ROCm Docker device mount.
 #   mi300_rdma router_rocm_mi300_2 coordinator. No Docker plugin; the job SSHes to the decode host.
 #
@@ -30,7 +32,7 @@ mirror_hardwares:
           nodeSelector:
             vllm.ci/gpu-pool: l4x4
           containers:
-          - image: nvidia/cuda:13.0.2-devel-ubuntu22.04
+          - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
             resources:
               limits:
                 nvidia.com/gpu: 4

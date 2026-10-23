@@ -1,0 +1,26 @@
+# NVIDIA P/D CI image. Built by .buildkite/scripts/build-ci-image.sh and
+# pulled by the l4_4 preset. CPU Rust and Python jobs stay on rust:bookworm.
+# The router binary is the CPU build artifact, not compiled into this image.
+FROM nvidia/cuda:13.0.2-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY .buildkite/ci_apt_packages.conf /opt/ci/ci_apt_packages.conf
+COPY .buildkite/scripts/install_apt_packages.sh /opt/ci/scripts/install_apt_packages.sh
+RUN bash /opt/ci/scripts/install_apt_packages.sh nvidia_pd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN uv venv --python 3.12 --seed /opt/vllm-router-ci/.venv
+ENV VIRTUAL_ENV=/opt/vllm-router-ci/.venv
+ENV PATH="/opt/vllm-router-ci/.venv/bin:/root/.local/bin:${PATH}"
+
+# Same packages the P/D jobs used to install on every run. L3 needs lm-eval;
+# L1 skips the eval at runtime. A CPU builder has no NVIDIA driver, so the
+# CUDA wheel check stays in the GPU job.
+RUN uv pip install vllm --torch-backend=cu130 \
+    && uv pip install nixl-cu13 \
+    && uv pip install nixl --no-deps \
+    && uv pip install requests pytest openai hf_transfer 'lm-eval[api]==0.4.12'

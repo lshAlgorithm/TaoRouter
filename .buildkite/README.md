@@ -4,18 +4,19 @@ This directory contains the Buildkite pipeline configurations for the vLLM Route
 
 ## Pipeline Files
 
-`pipeline.yml` builds the release binary and wheel, then uploads L1, L2, and L3.
-Those uploads depend on the build step, not on each other. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
+`pipeline.yml` builds the release binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
+Those uploads depend on the build step, not on each other. The L1 and L3 NVIDIA P/D jobs also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
 on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
 | File | Level | When it is uploaded | What runs |
 | --- | --- | --- | --- |
-| `test-ready.yml` | L1 ready | every build, after the `build` group in `pipeline.yml` | Rust and Python unit/integration tests, image build, one NVIDIA P/D completion on trusted builds |
+| `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, product image build, one NVIDIA P/D completion |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), or any other branch labeled `merge-test` | one-mode xGMI smoke (still opt-in, #363) and RDMA `SMOKE_ONLY` |
 | `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, any other branch labeled `nightly-test`, or `RUN_ROCM_RDMA=1` / `RUN_ROCM_XGMI=1` | full NVIDIA GSM8K, full xGMI matrix, full RDMA |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
-Fork pull requests upload L1 only. GPU steps in L1 also skip forks.
+A pull request labeled `ready` uploads every job in `test-ready.yml`, including
+forks. There is no per-job fork skip inside that file.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
 A step names one with `mirror_hardwares`. `scripts/upload_pipeline.py` expands
@@ -23,11 +24,11 @@ that name into `agents` and `plugins` before Buildkite upload.
 
 | Name | Machine |
 | --- | --- |
-| `l4_4` | EKS `l4-k8s`, 4× L4 |
+| `l4_4` | EKS `l4-k8s`, 4× L4, image `public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT` |
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 
-CPU steps keep `cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset.
+CPU steps keep `medium_cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset. Apt packages are named sets in `ci_apt_packages.conf`, installed with `scripts/install_apt_packages.sh`.
 
 ### `release-pipeline.yml`
 Release pipeline for tagged versions, nightly Docker images, and versioned
@@ -181,7 +182,7 @@ Builds Docker image for the router.
 
 ## Agent Queues
 
-- `cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
+- `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation)
 - `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
 - `default`: General purpose queue
@@ -203,7 +204,7 @@ Example:
   command: |
     # Test commands here
   agents:
-    queue: "cpu_queue_premerge"
+    queue: "medium_cpu_queue_premerge"
   depends_on: "build"
   artifact_paths:
     - "test-results/**/*"

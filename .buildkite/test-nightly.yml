@@ -45,76 +45,27 @@ steps:
         reason: "GPU tests can be flaky - retry if needed"
     mirror_hardwares: l4_4
     # agent-stack-k8s invokes the step with /bin/sh. Dash rejects
-    # `set -o pipefail` and `source`, so run the job body under bash.
+    # `set -o pipefail`, so run the job body under bash.
     command: |
       bash <<'BASH'
       set -euo pipefail
 
-      # Verify HF_TOKEN is set (required for gated models like Llama)
-      if [ -z "$${HF_TOKEN:-}" ]; then
-        echo "ERROR: HF_TOKEN is not set. This is required for gated models."
-        echo "Please configure the hf-token-secret Kubernetes secret."
-        exit 1
-      fi
-      echo "HF_TOKEN is configured."
+      # vLLM, NIXL, and lm-eval are on PATH in the image built by image-build.
 
-      # Install system dependencies
-      apt-get update && apt-get install -y \
-        curl \
-        ffmpeg \
-        python3 \
-        python3-pip \
-        pkg-config \
-        libssl-dev \
-        protobuf-compiler \
-        git
-
-      # Install uv for fast Python package management
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      source /root/.local/bin/env
-
-      # Create Python virtual environment (as recommended by vLLM)
-      uv venv --python 3.12 --seed
-      source .venv/bin/activate
-
-      # Install vLLM with CUDA 13 support
-      uv pip install vllm --torch-backend=cu130
-
-      # Install NIXL library for P/D disaggregation
-      uv pip install nixl-cu13
-      uv pip install nixl --no-deps
-
-      # Fail fast if CUDA-specific wheels do not match the CI image.
-      python - <<'PY'
-      import nixl
-      import nixl_ep
-      import torch
-      import vllm
-
-      assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
-      assert nixl._api.__name__.startswith("nixl_cu13."), nixl._api.__name__
-      print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}, {nixl._api.__name__}, {nixl_ep.__name__}")
-      PY
-
-      # Install test dependencies
-      uv pip install requests pytest openai
-
-      # Install LM Evaluation Harness with API extras for accuracy testing
-      uv pip install 'lm-eval[api]>=0.4.0' hf_transfer
-
-      # Install Rust for building the router
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-      source /root/.cargo/env
-
-      # Build the router
-      cargo build --release
+      # Reuse the release binary from the CPU build. run_accuracy_test.sh
+      # compiles from source only when vllm-router is not on PATH.
+      buildkite-agent artifact download "target/release/vllm-router" .
+      chmod +x target/release/vllm-router
       export PATH="$$PWD/target/release:$$PATH"
+      vllm-router --version
 
       # Run P/D disaggregation test
       cd py_test/e2e/pd_disagg_vllm
       bash ./run_accuracy_test.sh
       BASH
-    depends_on: "build"
+    depends_on:
+      - "build"
+      - "image-build"
     artifact_paths:
       - "/tmp/router.log"
 

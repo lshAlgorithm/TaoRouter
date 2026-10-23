@@ -1,7 +1,7 @@
 # L1 ready (https://github.com/vllm-project/router/issues/273).
-# Uploaded on every build by pipeline.yml, after the build group there.
+# Uploaded when a non-default branch has the ready label (Omni READY_LABEL_IF).
 # CPU unit and integration tests, a non-publishing image build, and one
-# NVIDIA P/D completion on trusted builds. Full GSM8K is test-nightly.yml.
+# NVIDIA P/D completion. Full GSM8K is test-nightly.yml.
 # py_test/e2e stays ignored here; regular-router, embeddings, and
 # test_pd_router.py are not wired to a GPU lane in this split.
 
@@ -36,12 +36,12 @@ steps:
                 - bash
                 - -c
                 - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
+                  bash .buildkite/scripts/install_apt_packages.sh rust
                   # wasm_middleware unit tests load the example component artifact
                   bash examples/wasm_middleware/build.sh
                   cargo test --lib --bins
         agents:
-          queue: "cpu_queue_premerge"
+          queue: "medium_cpu_queue_premerge"
 
       - label: ":rust: Rust Integration Tests"
         plugins:
@@ -57,10 +57,10 @@ steps:
                 - bash
                 - -c
                 - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
+                  bash .buildkite/scripts/install_apt_packages.sh rust
                   cargo test --test '*'
         agents:
-          queue: "cpu_queue_premerge"
+          queue: "medium_cpu_queue_premerge"
 
       - label: ":python: Python Tests"
         plugins:
@@ -76,7 +76,7 @@ steps:
                 - bash
                 - -c
                 - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip python3-dev python3-venv
+                  bash .buildkite/scripts/install_apt_packages.sh python
                   # WASM middleware pytest needs the example component + router binary
                   bash examples/wasm_middleware/build.sh
                   cargo build --release --bin vllm-router
@@ -89,24 +89,15 @@ steps:
         artifact_paths:
           - "coverage.xml"
         agents:
-          queue: "cpu_queue_premerge"
+          queue: "medium_cpu_queue_premerge"
 
   # ============================================================================
   # L1 P/D smoke — one /v1/completions on EKS l4-k8s (4x L4).
   # /health and /v1/models run inside test_pd_accuracy.py.
-  # Full GSM8K is test-nightly.yml. Forks skip this job.
+  # Full GSM8K is test-nightly.yml. This file is only uploaded for ready.
   # ============================================================================
   - label: ":satellite: P/D Disaggregation Smoke (4 GPUs)"
     key: "pd-disagg-smoke"
-    # ROCm-only scheduled builds use the dedicated MI300X queue and should not
-    # wait for an unrelated NVIDIA worker before the build can finish.
-    # Trusted builds only. Forks have no GPU secrets. Nightly runs full GSM8K
-    # from test-nightly.yml instead of this smoke.
-    if: |
-      build.env("ROCM_ONLY") != "1" &&
-      build.env("NIGHTLY") != "1" &&
-      (build.pull_request.id == null || build.pull_request.repository.fork == false) &&
-      (build.pull_request.id == null || !(build.pull_request.labels includes "nightly-test"))
     timeout_in_minutes: 60
     retry:
       automatic:
@@ -117,70 +108,19 @@ steps:
         reason: "GPU tests can be flaky - retry if needed"
     mirror_hardwares: l4_4
     # agent-stack-k8s invokes the step with /bin/sh. Dash rejects
-    # `set -o pipefail` and `source`, so run the job body under bash.
+    # `set -o pipefail`, so run the job body under bash.
     command: |
       bash <<'BASH'
       set -euo pipefail
 
-      # Verify HF_TOKEN is set (required for gated models like Llama)
-      if [ -z "$${HF_TOKEN:-}" ]; then
-        echo "ERROR: HF_TOKEN is not set. This is required for gated models."
-        echo "Please configure the hf-token-secret Kubernetes secret."
-        exit 1
-      fi
-      echo "HF_TOKEN is configured."
+      # vLLM, NIXL, and lm-eval are on PATH in the image built by image-build.
 
-      # Install system dependencies
-      apt-get update && apt-get install -y \
-        curl \
-        ffmpeg \
-        python3 \
-        python3-pip \
-        pkg-config \
-        libssl-dev \
-        protobuf-compiler \
-        git
-
-      # Install uv for fast Python package management
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      source /root/.local/bin/env
-
-      # Create Python virtual environment (as recommended by vLLM)
-      uv venv --python 3.12 --seed
-      source .venv/bin/activate
-
-      # Install vLLM with CUDA 13 support
-      uv pip install vllm --torch-backend=cu130
-
-      # Install NIXL library for P/D disaggregation
-      uv pip install nixl-cu13
-      uv pip install nixl --no-deps
-
-      # Fail fast if CUDA-specific wheels do not match the CI image.
-      python - <<'PY'
-      import nixl
-      import nixl_ep
-      import torch
-      import vllm
-
-      assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
-      assert nixl._api.__name__.startswith("nixl_cu13."), nixl._api.__name__
-      print(f"vLLM {vllm.__version__}, torch CUDA {torch.version.cuda}, {nixl._api.__name__}, {nixl_ep.__name__}")
-      PY
-
-      # Install test dependencies
-      uv pip install requests pytest openai
-
-      # Model download uses hf_transfer. Full GSM8K / LM-Eval is test-nightly.yml.
-      uv pip install hf_transfer
-
-      # Install Rust for building the router
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-      source /root/.cargo/env
-
-      # Build the router
-      cargo build --release
+      # Reuse the release binary from the CPU build. run_accuracy_test.sh
+      # compiles from source only when vllm-router is not on PATH.
+      buildkite-agent artifact download "target/release/vllm-router" .
+      chmod +x target/release/vllm-router
       export PATH="$$PWD/target/release:$$PATH"
+      vllm-router --version
 
       # L1 smoke: /health, /v1/models, and one completion. Not full GSM8K.
       cd py_test/e2e/pd_disagg_vllm
@@ -188,7 +128,9 @@ steps:
       export NUM_SANITY_REQUESTS=1
       bash ./run_accuracy_test.sh
       BASH
-    depends_on: "build"
+    depends_on:
+      - "build"
+      - "image-build"
     artifact_paths:
       - "/tmp/router.log"
 
@@ -200,5 +142,5 @@ steps:
       docker build -f Dockerfile.router -t vllm-router:${BUILDKITE_COMMIT} .
       docker tag vllm-router:${BUILDKITE_COMMIT} vllm-router:latest
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
     depends_on: "build"
