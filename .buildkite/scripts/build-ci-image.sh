@@ -4,6 +4,7 @@
 # it does not replace another project's image for the same commit SHA.
 #
 # Expects BUILDKITE_COMMIT from the Buildkite agent.
+# The CPU build step must already have uploaded target/release/vllm-router.
 
 set -euo pipefail
 
@@ -22,12 +23,15 @@ IMAGE_TAG="router-${BUILDKITE_COMMIT}"
 echo "BUILDKITE_COMMIT: ${BUILDKITE_COMMIT}"
 echo "Image: ${REGISTRY}:${IMAGE_TAG}"
 
+buildkite-agent artifact download "target/release/vllm-router" .
+chmod +x target/release/vllm-router
+
 aws ecr-public get-login-password --region "${REGION}" \
   | docker login --username AWS --password-stdin "${ECR_NAMESPACE}"
 
 # Cache key covers the image inputs. The router- prefix keeps this cache
 # off the deps-cache-* tags used by vllm-omni and afd-plugin.
-DEP_FILES="${DOCKERFILE} .buildkite/ci_apt_packages.conf .buildkite/scripts/install_apt_packages.sh"
+DEP_FILES="${DOCKERFILE} .buildkite/ci_apt_packages.conf .buildkite/scripts/install_packages.sh"
 CACHE_KEY="$(cat ${DEP_FILES} | sha256sum | cut -c1-16)"
 CACHE_TAG="router-deps-cache-${CACHE_KEY}"
 echo "Cache key: ${CACHE_TAG}"

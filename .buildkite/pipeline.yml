@@ -37,7 +37,7 @@ steps:
                 - bash
                 - -c
                 - |
-                  bash .buildkite/scripts/install_apt_packages.sh rust
+                  bash .buildkite/scripts/install_packages.sh rust
                   cargo build --release
         artifact_paths:
           - "target/release/vllm-router"
@@ -58,10 +58,7 @@ steps:
                 - bash
                 - -c
                 - |
-                  bash .buildkite/scripts/install_apt_packages.sh python
-                  python3 -m venv /tmp/venv
-                  source /tmp/venv/bin/activate
-                  pip install -U pip setuptools wheel setuptools-rust build
+                  source .buildkite/scripts/install_packages.sh python-wheel
                   python -m build
         artifact_paths:
           - "dist/*.whl"
@@ -69,11 +66,12 @@ steps:
         agents:
           queue: "medium_cpu_queue_premerge"
 
-  # Push docker/Dockerfile.ci for l4_4 jobs that depend_on this key.
-  # Ready smoke needs it when the PR has the ready label. Nightly GSM8K
-  # needs it on default-branch NIGHTLY=1 or nightly-test.
+  # After the CPU build, copy target/release/vllm-router into the image.
+  # Steps that depend only on "build" start without waiting for this.
+  # Ready smoke and nightly GSM8K depend on this key.
   - label: ":docker: Build NVIDIA CI image"
     key: "image-build"
+    depends_on: "build"
     if: |
       build.env("ROCM_ONLY") != "1" &&
       (
@@ -94,8 +92,8 @@ steps:
     agents:
       queue: "medium_cpu_queue_premerge"
 
-  # Uploads wait for the build group, the same way Omni uploads wait for image-build.
-  # They do not wait on each other. NVIDIA P/D jobs also depend_on "image-build".
+  # Uploads wait for the build group, not for image-build, and not for each other.
+  # NVIDIA P/D jobs depend on image-build.
   # L1: same gate as Omni READY_LABEL_IF. The file has no per-job fork check.
   - label: ":pipeline: Upload L1 ready"
     key: "upload-ready-pipeline"
@@ -128,8 +126,7 @@ steps:
       queue: "medium_cpu_queue_premerge"
 
   # L3: default-branch NIGHTLY=1, or any other branch labeled nightly-test.
-  # RUN_ROCM_* is a UI/API env, not a GitHub label, so it stays a third clause.
-  # Each ROCm job still has its own if.
+  # RUN_ROCM_* stays on the jobs in test-nightly.yml, not on this upload.
   - label: ":pipeline: Upload L3 nightly"
     key: "upload-nightly-pipeline"
     depends_on: "build"
@@ -141,9 +138,7 @@ steps:
       (
         build.branch != pipeline.default_branch &&
         build.pull_request.labels includes "nightly-test"
-      ) ||
-      build.env("RUN_ROCM_RDMA") == "1" ||
-      build.env("RUN_ROCM_XGMI") == "1"
+      )
     command: |
       python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/test-nightly.yml
     agents:

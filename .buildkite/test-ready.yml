@@ -36,9 +36,7 @@ steps:
                 - bash
                 - -c
                 - |
-                  bash .buildkite/scripts/install_apt_packages.sh rust
-                  # wasm_middleware unit tests load the example component artifact
-                  bash examples/wasm_middleware/build.sh
+                  bash .buildkite/scripts/install_packages.sh rust
                   cargo test --lib --bins
         agents:
           queue: "medium_cpu_queue_premerge"
@@ -57,7 +55,7 @@ steps:
                 - bash
                 - -c
                 - |
-                  bash .buildkite/scripts/install_apt_packages.sh rust
+                  bash .buildkite/scripts/install_packages.sh rust
                   cargo test --test '*'
         agents:
           queue: "medium_cpu_queue_premerge"
@@ -72,24 +70,18 @@ steps:
               environment:
                 - "CARGO_INCREMENTAL=0"
                 - "RUST_BACKTRACE=1"
+              mount-buildkite-agent: true
               command:
                 - bash
                 - -c
                 - |
-                  bash .buildkite/scripts/install_apt_packages.sh python
-                  # WASM middleware pytest needs the example component + router binary
-                  bash examples/wasm_middleware/build.sh
-                  cargo build --release --bin vllm-router
-                  python3 -m venv /tmp/venv
-                  source /tmp/venv/bin/activate
-                  pip install -U pip setuptools wheel setuptools-rust
-                  pip install -e .[dev]
-                  pip install pytest pytest-cov pytest-asyncio
+                  source .buildkite/scripts/install_packages.sh python
                   pytest py_test/ -v --ignore=py_test/e2e --cov=vllm_router --cov-report=xml --cov-report=term
         artifact_paths:
           - "coverage.xml"
         agents:
           queue: "medium_cpu_queue_premerge"
+        depends_on: "build"
 
   # ============================================================================
   # L1 P/D smoke — one /v1/completions on EKS l4-k8s (4x L4).
@@ -113,14 +105,7 @@ steps:
       bash <<'BASH'
       set -euo pipefail
 
-      # vLLM, NIXL, and lm-eval are on PATH in the image built by image-build.
-
-      # Reuse the release binary from the CPU build. run_accuracy_test.sh
-      # compiles from source only when vllm-router is not on PATH.
-      buildkite-agent artifact download "target/release/vllm-router" .
-      chmod +x target/release/vllm-router
-      export PATH="$$PWD/target/release:$$PATH"
-      vllm-router --version
+      # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image.
 
       # L1 smoke: /health, /v1/models, and one completion. Not full GSM8K.
       cd py_test/e2e/pd_disagg_vllm
@@ -128,9 +113,7 @@ steps:
       export NUM_SANITY_REQUESTS=1
       bash ./run_accuracy_test.sh
       BASH
-    depends_on:
-      - "build"
-      - "image-build"
+    depends_on: "image-build"
     artifact_paths:
       - "/tmp/router.log"
 
