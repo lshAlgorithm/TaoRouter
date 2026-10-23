@@ -15,7 +15,6 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).parents[2] / "benches" / "backend" / "bench_prefix_kvhit.py"
 SPEC = importlib.util.spec_from_file_location("bench_prefix_kvhit", SCRIPT)
 assert SPEC and SPEC.loader
