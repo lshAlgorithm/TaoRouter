@@ -281,6 +281,7 @@ mod dp_e2e_tests {
             epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            moriio_multi_pod: None,
         }
     }
 
@@ -331,6 +332,7 @@ mod dp_e2e_tests {
             epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            moriio_multi_pod: None,
         }
     }
 

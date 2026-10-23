@@ -91,6 +91,23 @@ pub struct RouterConfig {
     /// Optional Program-level admission and continuity scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_scheduling: Option<ProgramSchedulingConfig>,
+    /// Optional MoRI-IO multi-pod Wide-EP peer info (each role is one DP group spanning pods).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moriio_multi_pod: Option<MoriIOMultiPodConfig>,
+}
+
+/// MoRI-IO Wide-EP layout where each role is ONE DP group spanning several pods (nodes)
+/// behind a single registered URL. Only the DP master registers, so the router alone knows
+/// where the other pods are; it stamps the peer role's pod hosts and ranks-per-pod onto
+/// each WRITE-mode leg so the connector can reach DP ranks on every pod.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MoriIOMultiPodConfig {
+    /// DP ranks per pod; the connector maps global rank r to pod r / dp_size_local.
+    pub dp_size_local: usize,
+    /// Prefill pod hosts in DP-rank order (pod 0 = the DP master).
+    pub prefill_hosts: Vec<String>,
+    /// Decode pod hosts in DP-rank order (pod 0 = the DP master).
+    pub decode_hosts: Vec<String>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -951,6 +968,7 @@ impl Default for RouterConfig {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         }
     }
 }
@@ -1669,6 +1687,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1737,6 +1756,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1801,6 +1821,7 @@ mod tests {
             epd: None,
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         assert!(config.has_service_discovery());

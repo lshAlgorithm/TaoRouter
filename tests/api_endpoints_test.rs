@@ -64,6 +64,7 @@ impl TestContext {
             epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -480,6 +481,7 @@ mod generation_tests {
         let config = RouterConfig {
             policy: PolicyConfig::RoundRobin,
             program_scheduling: Some(ProgramSchedulingConfig::default()),
+            moriio_multi_pod: None,
             ..Default::default()
         };
         let ctx = TestContext::new_with_config(
@@ -538,6 +540,7 @@ mod generation_tests {
             },
             policy: PolicyConfig::RoundRobin,
             program_scheduling: Some(ProgramSchedulingConfig::default()),
+            moriio_multi_pod: None,
             retry: RetryConfig {
                 max_retries: 2,
                 initial_backoff_ms: 1,
@@ -1199,6 +1202,7 @@ mod responses_endpoint_tests {
         let config = RouterConfig {
             policy: PolicyConfig::RoundRobin,
             program_scheduling: Some(ProgramSchedulingConfig::default()),
+            moriio_multi_pod: None,
             ..Default::default()
         };
         let ctx = TestContext::new_with_config(
@@ -1609,6 +1613,7 @@ mod error_tests {
             epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1973,6 +1978,7 @@ mod pd_mode_tests {
             epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         // Create app context
@@ -2140,6 +2146,7 @@ mod request_id_tests {
             epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            moriio_multi_pod: None,
         };
 
         let ctx = TestContext::new_with_config(

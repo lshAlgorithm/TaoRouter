@@ -265,6 +265,8 @@ impl Router {
                 self.enable_program_scheduling,
                 self.program_scheduling_config_json.as_deref(),
             )?,
+            // MoRI-IO multi-pod is CLI-only for now (not exposed to the Python launcher).
+            moriio_multi_pod: None,
         })
     }
 }

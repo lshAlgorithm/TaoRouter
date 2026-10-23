@@ -2,8 +2,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, MoriIOMultiPodConfig,
+    PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -392,6 +392,19 @@ struct CliArgs {
     /// KV connector type for PD disaggregation (nixl or mooncake)
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
+
+    /// MoRI-IO multi-pod Wide-EP: DP ranks per pod, when each role is one DP group spanning
+    /// several nodes behind its master's URL. Requires --moriio-prefill-hosts/--moriio-decode-hosts.
+    #[arg(long)]
+    moriio_dp_size_local: Option<usize>,
+
+    /// MoRI-IO multi-pod Wide-EP: prefill pod hosts in DP-rank order (DP master first).
+    #[arg(long, num_args = 1..)]
+    moriio_prefill_hosts: Vec<String>,
+
+    /// MoRI-IO multi-pod Wide-EP: decode pod hosts in DP-rank order (DP master first).
+    #[arg(long, num_args = 1..)]
+    moriio_decode_hosts: Vec<String>,
 }
 
 impl CliArgs {
@@ -631,6 +644,15 @@ impl CliArgs {
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
             program_scheduling,
+            // Any of the three flags opts in; validation rejects a partial set.
+            moriio_multi_pod: (self.moriio_dp_size_local.is_some()
+                || !self.moriio_prefill_hosts.is_empty()
+                || !self.moriio_decode_hosts.is_empty())
+            .then(|| MoriIOMultiPodConfig {
+                dp_size_local: self.moriio_dp_size_local.unwrap_or(0),
+                prefill_hosts: self.moriio_prefill_hosts.clone(),
+                decode_hosts: self.moriio_decode_hosts.clone(),
+            }),
         })
     }
 
