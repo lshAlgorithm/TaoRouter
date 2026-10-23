@@ -4,14 +4,30 @@ This directory contains the Buildkite pipeline configurations for the vLLM Route
 
 ## Pipeline Files
 
-### `pipeline.yml`
-Main CI/CD pipeline that runs on all commits and pull requests. Includes:
+`pipeline.yml` builds the release binary and wheel, then uploads L1, L2, and L3.
+Those uploads depend on the build step, not on each other. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
+on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
-- **Build**: Release builds for Rust binary and Python wheels
-- **Tests**: Comprehensive test suite (unit, integration, Python)
-- **P/D Disaggregation Test**: GPU-based integration test for prefill/decode disaggregation
-- **Benchmarks**: Optional performance benchmarks
-- **Docker Build**: Container image creation
+| File | Level | When it is uploaded | What runs |
+| --- | --- | --- | --- |
+| `test-ready.yml` | L1 ready | every build, after the `build` group in `pipeline.yml` | Rust and Python unit/integration tests, image build, one NVIDIA P/D completion on trusted builds |
+| `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), or any other branch labeled `merge-test` | one-mode xGMI smoke (still opt-in, #363) and RDMA `SMOKE_ONLY` |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, any other branch labeled `nightly-test`, or `RUN_ROCM_RDMA=1` / `RUN_ROCM_XGMI=1` | full NVIDIA GSM8K, full xGMI matrix, full RDMA |
+| `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
+
+Fork pull requests upload L1 only. GPU steps in L1 also skip forks.
+
+GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
+A step names one with `mirror_hardwares`. `scripts/upload_pipeline.py` expands
+that name into `agents` and `plugins` before Buildkite upload.
+
+| Name | Machine |
+| --- | --- |
+| `l4_4` | EKS `l4-k8s`, 4× L4 |
+| `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
+| `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
+
+CPU steps keep `cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset.
 
 ### `release-pipeline.yml`
 Release pipeline for tagged versions, nightly Docker images, and versioned
@@ -48,49 +64,42 @@ The test script:
 
 ### CI Configuration
 
-The test runs in the pipeline at `.buildkite/pipeline.yml:97-132`:
-
-```yaml
-- label: ":satellite: P/D Disaggregation Test (4 GPUs)"
-  timeout_in_minutes: 30
-  retry:
-    automatic:
-      - exit_status: "*"
-        limit: 2
-```
+Trusted builds run one completion from `test-ready.yml`
+(`SKIP_LM_EVAL=true`, `NUM_SANITY_REQUESTS=1`). Full GSM8K stays in
+`test-nightly.yml`. Forks do not run either GPU job.
 
 **Key features:**
 - Requires 4 GPUs (runs on `l4-k8s`)
-- 30 minute timeout
+- 60 minute timeout
 - Automatic retry (up to 2 attempts) for flaky failures
 - Manual retry option available
 
 ### ROCm MoRI coverage
 
-The dedicated `router_rocm_mi300_2` queue adds two MI300X matrices, each with
-`read_mode=true` and `read_mode=false`:
+The dedicated `router_rocm_mi300_2` queue covers two MoRI lanes:
 
 - `run_moriio_accuracy_test.sh` uses two GPUs on one host with the xGMI backend.
 - `run_moriio_rdma_accuracy_test.sh` uses one GPU on each of two hosts with the
   RDMA backend.
 
-The xGMI group is opt-in only: it runs solely for trusted manual/API builds
-with `RUN_ROCM_XGMI=1`, because the MI300X host readiness gate cannot find
-the digest-pinned ROCm image and fails automatic default-branch/PR/
-merge-queue builds before any test runs
-(https://github.com/vllm-project/router/issues/363). The original automatic
-triggers are kept in a comment at the group definition for a minimal-diff
-restore once the host is fixed. The RDMA matrix runs for scheduled builds
-with `NIGHTLY=1`, or trusted manual/API builds with `RUN_ROCM_RDMA=1`.
-When active, group-level filtering prevents Docker plugin hooks from running
-for untrusted fork pull requests.
+xGMI stays opt-in (`RUN_ROCM_XGMI=1` on a manual/API build) until the MI300X
+host can pre-pull the digest-pinned image
+(https://github.com/vllm-project/router/issues/363). L2 is one `read_mode`
+plus `LM_EVAL_LIMIT=20`. L3 is the read+write matrix and 500-example GSM8K.
+The restore conditions are comments on those groups; they are the L2/L3
+triggers, not the old "every trusted PR" condition.
+
+L2 RDMA (`test-merge.yml`) sets `SMOKE_ONLY=true` and `read_mode=true`. L3
+RDMA runs both directions for scheduled `NIGHTLY=1`, or a manual/API build
+with `RUN_ROCM_RDMA=1`. Group-level filtering keeps the xGMI Docker plugin
+off untrusted fork pull requests.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
-`ROCM_ONLY=1` skips the unrelated NVIDIA four-GPU P/D step while retaining the
-CPU build that supplies the router artifact to both ROCm matrices.
+`ROCM_ONLY=1` skips the NVIDIA four-GPU step while retaining the CPU build
+that supplies the router artifact to the ROCm jobs.
 
-Both matrices use a digest-pinned ROCm vLLM image and run health, sanity, and
-500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
+The L3 matrices use a digest-pinned ROCm vLLM image and run health, sanity,
+and 500-example GSM8K accuracy checks. The RDMA job is coordinator-owned and
 controls the second host through the strict `vllm-router-rocm-worker` SSH alias.
 
 ### Environment Variables
@@ -108,6 +117,8 @@ The test script supports these environment variables for customization:
 | `NUM_DECODE_INSTANCES` | `1` | Number of decode instances |
 | `PREFILLER_TP_SIZE` | `1` | Tensor parallel size for prefill |
 | `DECODER_TP_SIZE` | `1` | Tensor parallel size for decode |
+| `NUM_SANITY_REQUESTS` | `20` | Completions before GSM8K. L1 sets `1` |
+| `SKIP_LM_EVAL` | `false` | Skip full GSM8K. L1 sets `true` |
 
 ### Artifacts
 
@@ -148,9 +159,11 @@ bash ./run_accuracy_test.sh
 ## Additional Pipeline Steps
 
 ### Build
-Creates release artifacts:
+The `build` group in `pipeline.yml` creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
 - Python wheels and source distribution
+
+L1, L2, and L3 uploads depend on this group. L2 and L3 do not depend on the L1 upload.
 
 ### Tests
 Comprehensive test suite:
@@ -179,7 +192,7 @@ To add a new test step:
 
 1. Choose appropriate location in pipeline
 2. Define test command and dependencies
-3. Specify agent queue
+3. Set `mirror_hardwares` to a name in `ci_mirror_hardwares.yml` (GPU) or an agent queue (CPU)
 4. Add artifact collection
 5. Consider retry logic for flaky tests
 6. Update this documentation
