@@ -103,6 +103,10 @@ pub(super) fn merge_pd_usage(prefill: &Value, decode: &mut Value) -> bool {
             .and_then(|output| input.checked_add(output))
         {
             changed |= replace_if_changed(target, "total_tokens", Value::from(total));
+        } else {
+            // The old total describes Decode's input, not the Prefill count we
+            // just adopted. Unknown output or overflow makes it unrecomputable.
+            changed |= target.remove("total_tokens").is_some();
         }
     }
 
@@ -199,6 +203,56 @@ mod tests {
         let mut decode = json!({"usage": {"completion_tokens": 1}});
         assert!(merge_pd_usage(&prefill, &mut decode));
         assert!(decode["usage"].get("total_tokens").is_none());
+    }
+
+    #[test]
+    fn stale_totals_are_removed_when_decode_output_is_unavailable_or_overflows() {
+        for (input_key, output_key, nested) in [
+            ("prompt_tokens", "completion_tokens", false),
+            ("input_tokens", "output_tokens", false),
+            ("input_tokens", "output_tokens", true),
+        ] {
+            for original_input in [999, 70] {
+                for output in [
+                    None,
+                    Some(json!(null)),
+                    Some(json!(-1)),
+                    Some(json!("8")),
+                    Some(json!(1.5)),
+                ] {
+                    let prefill = json!({"usage": {input_key: 70, output_key: 1}});
+                    let mut decode = json!({"usage": {input_key: original_input, "total_tokens": 1007, "future": 9}});
+                    if let Some(output) = &output {
+                        decode["usage"][output_key] = output.clone();
+                    }
+                    if nested {
+                        decode = json!({"type": "response.completed", "response": decode});
+                    }
+                    assert!(merge_pd_usage(&prefill, &mut decode));
+                    let usage = usage_object(&decode).unwrap();
+                    assert_eq!(usage[input_key], 70);
+                    assert!(
+                        usage.get("total_tokens").is_none(),
+                        "stale total retained: {decode}"
+                    );
+                    assert_eq!(usage.get(output_key), output.as_ref());
+                    assert_eq!(usage["future"], 9);
+                    assert!(!merge_pd_usage(&prefill, &mut decode));
+                }
+            }
+            let prefill = json!({"usage": {input_key: u64::MAX}});
+            let mut decode =
+                json!({"usage": {input_key: 999, output_key: 1, "total_tokens": 1000}});
+            if nested {
+                decode = json!({"response": decode});
+            }
+            assert!(merge_pd_usage(&prefill, &mut decode));
+            let usage = usage_object(&decode).unwrap();
+            assert_eq!(usage[input_key], u64::MAX);
+            assert_eq!(usage[output_key], 1);
+            assert!(usage.get("total_tokens").is_none());
+            assert!(!merge_pd_usage(&prefill, &mut decode));
+        }
     }
 
     #[test]

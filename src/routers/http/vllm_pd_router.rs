@@ -3467,6 +3467,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalizer_reconciles_usage_accounting_edge_cases_for_json_and_sse() {
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            let (input_key, output_key, details_key) = if path == "/v1/responses" {
+                ("input_tokens", "output_tokens", "input_tokens_details")
+            } else {
+                (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "prompt_tokens_details",
+                )
+            };
+            let prefill = json!({"usage": {input_key: 70, output_key: 1,
+                details_key: {"cached_tokens": 90, "audio_tokens": 3}}});
+            for streaming in [false, true] {
+                for output in [
+                    None,
+                    Some(json!(null)),
+                    Some(json!(-1)),
+                    Some(json!(0)),
+                    Some(json!(8)),
+                ] {
+                    let mut decode = json!({"usage": {input_key: 999, "total_tokens": 1007,
+                        details_key: {"cached_tokens": 99, "audio_tokens": 2, "future": 7}, "future": 9}});
+                    if let Some(output) = &output {
+                        decode["usage"][output_key] = output.clone();
+                    }
+                    if streaming && path == "/v1/responses" {
+                        decode = json!({"type": "response.completed", "response": decode});
+                    }
+                    let (content_type, raw) = if streaming {
+                        (
+                            "text/event-stream",
+                            format!("data: {decode}\n\ndata: [DONE]\n\n").into_bytes(),
+                        )
+                    } else {
+                        ("application/json", serde_json::to_vec(&decode).unwrap())
+                    };
+                    let upstream = axum::http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", content_type)
+                        .header("content-length", raw.len())
+                        .body(raw)
+                        .unwrap();
+                    let response = finalize_decode_response(
+                        upstream.into(),
+                        Some(&prefill),
+                        path,
+                        streaming,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()["content-type"], content_type);
+                    assert!(response.headers().get("content-length").is_none());
+                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let result: Value = if streaming {
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        assert!(text.ends_with("data: [DONE]\n\n"));
+                        serde_json::from_str(
+                            text.lines().next().unwrap().strip_prefix("data: ").unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice(&bytes).unwrap()
+                    };
+                    let usage = usage_merge::usage_object(&result).unwrap();
+                    assert_eq!(usage[input_key], 70);
+                    assert_eq!(usage.get(output_key), output.as_ref());
+                    let total = output
+                        .as_ref()
+                        .and_then(Value::as_u64)
+                        .map(|count| json!(70 + count));
+                    assert_eq!(usage.get("total_tokens"), total.as_ref());
+                    assert_eq!(usage[details_key], json!({"audio_tokens": 3, "future": 7}));
+                    assert_eq!(usage["future"], 9);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn finalizer_removes_decode_cache_when_prefill_did_not_report_it() {
         let (decode, server) = mock_decode_response(
             StatusCode::OK,

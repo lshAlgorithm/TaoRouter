@@ -21,11 +21,24 @@ pub(super) fn is_supported_path(path: &str) -> bool {
 
 pub(super) fn prefill_cached_tokens(prefill: Option<&Value>) -> Option<u64> {
     let usage = usage_merge::usage_object(prefill?)?;
-    // Validate each candidate independently, so an invalid legacy spelling
-    // cannot hide a valid Responses spelling. Zero is a valid cache count.
-    ["prompt_tokens_details", "input_tokens_details"]
-        .iter()
-        .find_map(|key| usage.get(*key)?.get("cached_tokens")?.as_u64())
+    // Validate each candidate against its matching input count, so an invalid
+    // legacy spelling cannot hide a valid Responses spelling. Keep support for
+    // details-only snapshots; an explicit input count must be valid and bound
+    // the cache count. Zero remains a valid cache count.
+    [
+        ("prompt_tokens_details", "prompt_tokens"),
+        ("input_tokens_details", "input_tokens"),
+    ]
+    .iter()
+    .find_map(|(details_key, input_key)| {
+        let cached = usage.get(*details_key)?.get("cached_tokens")?.as_u64()?;
+        if let Some(input) = usage.get(*input_key) {
+            if cached > input.as_u64()? {
+                return None;
+            }
+        }
+        Some(cached)
+    })
 }
 
 /// Change only the cached-token detail. A missing Prefill value removes a
@@ -573,6 +586,43 @@ mod tests {
         ] {
             assert_eq!(prefill_cached_tokens(Some(&value)), None);
         }
+    }
+
+    #[test]
+    fn prefill_cache_is_bounded_by_the_matching_input_count() {
+        for (input_key, details_key) in [
+            ("prompt_tokens", "prompt_tokens_details"),
+            ("input_tokens", "input_tokens_details"),
+        ] {
+            for nested in [false, true] {
+                for (input, cached, expected) in [
+                    (70, 90, None),
+                    (0, 1, None),
+                    (0, 0, Some(0)),
+                    (70, 70, Some(70)),
+                    (70, 4, Some(4)),
+                    (u64::MAX, u64::MAX, Some(u64::MAX)),
+                ] {
+                    let mut prefill = json!({"usage": {input_key: input, details_key: {"cached_tokens": cached}}});
+                    if nested {
+                        prefill = json!({"response": prefill});
+                    }
+                    assert_eq!(prefill_cached_tokens(Some(&prefill)), expected, "{prefill}");
+                }
+                for invalid_input in [json!(null), json!(-1), json!("70"), json!(1.5)] {
+                    let mut prefill = json!({"usage": {input_key: invalid_input, details_key: {"cached_tokens": 4}}});
+                    if nested {
+                        prefill = json!({"response": prefill});
+                    }
+                    assert_eq!(prefill_cached_tokens(Some(&prefill)), None, "{prefill}");
+                }
+            }
+        }
+        let prefill = json!({"usage": {
+            "prompt_tokens": 70, "prompt_tokens_details": {"cached_tokens": 90},
+            "input_tokens": 100, "input_tokens_details": {"cached_tokens": 80}
+        }});
+        assert_eq!(prefill_cached_tokens(Some(&prefill)), Some(80));
     }
 
     #[test]
