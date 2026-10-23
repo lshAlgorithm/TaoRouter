@@ -24,6 +24,15 @@ pub fn chat_to_generate_request(
     token_ids: Vec<u32>,
     request_id: String,
 ) -> Result<pb::GenerateRequest, String> {
+    chat_to_generate_request_with_progress(request, token_ids, request_id, false)
+}
+
+pub fn chat_to_generate_request_with_progress(
+    request: &ChatCompletionRequest,
+    token_ids: Vec<u32>,
+    request_id: String,
+    include_prefill_progress: bool,
+) -> Result<pb::GenerateRequest, String> {
     if request.n.unwrap_or(1) > 1 {
         return Err("n > 1 is not supported by vLLM 0.29 GenerateStream; use n=1".to_string());
     }
@@ -127,9 +136,9 @@ pub fn chat_to_generate_request(
         temperature: Some(request.temperature.unwrap_or(1.0)),
         sampling: Some(pb::RandomSampling {
             num_sequences: request.n.unwrap_or(0),
-            top_k: request.top_k.unwrap_or(0) as u32,
-            top_p: request.top_p.unwrap_or(0.0),
-            min_p: request.min_p.unwrap_or(0.0),
+            top_k: request.top_k.map(|top_k| top_k as u32),
+            top_p: request.top_p,
+            min_p: request.min_p,
             seed: request.seed,
         }),
         decoding: Some(decoding),
@@ -140,6 +149,7 @@ pub fn chat_to_generate_request(
             stop_strings,
             include_stop_strings: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
+            thinking_token_budget: None,
         }),
         response: Some(pb::ResponseOptions {
             // Worker text carries the exact character-level trim boundary for
@@ -168,6 +178,7 @@ pub fn chat_to_generate_request(
             .unwrap_or_default()
             .to_string(),
         watermarking: other_bool(request, "watermarking")?,
+        include_prefill_progress,
         ..Default::default()
     })
 }

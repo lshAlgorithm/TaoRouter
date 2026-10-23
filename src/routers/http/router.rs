@@ -117,6 +117,12 @@ impl RequestLoadGuard {
         }
     }
 
+    fn update_prefill_progress(&self, sequence: u64, remaining_tokens: u64) {
+        if let Some(slot) = &self.state.kv_slot {
+            slot.update_prefill_progress(sequence, remaining_tokens);
+        }
+    }
+
     fn release(&self) {
         if self.state.released.swap(true, Ordering::AcqRel) {
             return;
@@ -1619,9 +1625,23 @@ impl Router {
                 Some(Arc::new(move || load.begin_decode())
                     as crate::backend::grpc::FirstOutputCallback)
             };
+            let on_prefill_progress = if load.state.kv_slot.is_some() {
+                let load = load.clone();
+                Some(Arc::new(move |sequence, remaining| {
+                    load.update_prefill_progress(sequence, remaining)
+                })
+                    as crate::backend::grpc::PrefillProgressCallback)
+            } else {
+                None
+            };
             let mut response = self
                 .frontend
-                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .dispatch_with_first_output(
+                    worker_url,
+                    prepared,
+                    on_first_output,
+                    on_prefill_progress,
+                )
                 .await;
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);

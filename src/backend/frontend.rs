@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::response::Response;
 
-use super::grpc::{FirstOutputCallback, GrpcEngineBackend};
+use super::grpc::{FirstOutputCallback, GrpcEngineBackend, PrefillProgressCallback};
 use super::preprocess::{tokenize_chat_request_timed, FrontendHandle, TokenizeOut, TokenizerCache};
 use crate::protocols::spec::ChatCompletionRequest;
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -113,7 +113,7 @@ impl EngineFrontend {
 
     /// Convert + GenerateStream + detok on the selected worker URL.
     pub async fn dispatch(&self, worker_url: &str, prepared: PreparedChat) -> Response {
-        self.dispatch_with_first_output(worker_url, prepared, None)
+        self.dispatch_with_first_output(worker_url, prepared, None, None)
             .await
     }
 
@@ -122,9 +122,10 @@ impl EngineFrontend {
         worker_url: &str,
         prepared: PreparedChat,
         on_first_output: Option<FirstOutputCallback>,
+        on_prefill_progress: Option<PrefillProgressCallback>,
     ) -> Response {
         self.grpc
-            .dispatch_prepared(worker_url, prepared, on_first_output)
+            .dispatch_prepared(worker_url, prepared, on_first_output, on_prefill_progress)
             .await
     }
 

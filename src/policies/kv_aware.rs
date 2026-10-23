@@ -1,10 +1,11 @@
 //! Exact KV-placement and live-load aware worker selection.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
@@ -50,9 +51,14 @@ pub fn kv_aware_ops(policy: &dyn LoadBalancingPolicy) -> Option<&dyn KvAwareOps>
 pub struct KvRequestSlot {
     manager: Arc<dyn SlotManager>,
     target: RoutableTarget,
+    accounting: Arc<Mutex<KvSlotAccounting>>,
+}
+
+struct KvSlotAccounting {
     prefill_tokens: u64,
+    sequence: u64,
     // 0 = prefill, 1 = decode, 2 = freed.
-    state: Arc<AtomicU8>,
+    state: u8,
 }
 
 impl KvRequestSlot {
@@ -64,29 +70,41 @@ impl KvRequestSlot {
         Self {
             manager,
             target,
-            prefill_tokens,
-            state: Arc::new(AtomicU8::new(0)),
+            accounting: Arc::new(Mutex::new(KvSlotAccounting {
+                prefill_tokens,
+                sequence: 0,
+                state: 0,
+            })),
         }
     }
 
+    /// Replace this request's remaining prefill work with a newer worker snapshot.
+    pub fn update_prefill_progress(&self, sequence: u64, remaining_tokens: u64) {
+        let mut accounting = self.accounting.lock();
+        if accounting.state != 0 || sequence <= accounting.sequence {
+            return;
+        }
+        let previous = accounting.prefill_tokens;
+        accounting.prefill_tokens = remaining_tokens;
+        accounting.sequence = sequence;
+        self.manager
+            .adjust_prefill(&self.target, previous, remaining_tokens);
+    }
+
     pub fn begin_decode(&self) {
-        if self
-            .state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        let mut accounting = self.accounting.lock();
+        if accounting.state == 0 {
+            accounting.state = 1;
             self.manager
-                .begin_decode(&self.target, &self.target, self.prefill_tokens);
+                .begin_decode(&self.target, &self.target, accounting.prefill_tokens);
         }
     }
 
     pub fn release(&self) {
         self.begin_decode();
-        if self
-            .state
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        let mut accounting = self.accounting.lock();
+        if accounting.state == 1 {
+            accounting.state = 2;
             self.manager.free(&self.target);
         }
     }
@@ -104,6 +122,7 @@ pub trait LoadProvider: Send + Sync {
 
 pub trait SlotManager: LoadProvider {
     fn begin_prefill(&self, target: &RoutableTarget, prefill_tokens: u64);
+    fn adjust_prefill(&self, target: &RoutableTarget, old_tokens: u64, new_tokens: u64);
     fn begin_decode(
         &self,
         prefill_target: &RoutableTarget,
@@ -188,6 +207,17 @@ impl SlotManager for InMemorySlotManager {
             slot.active_prefill_tokens
                 .fetch_add(prefill_tokens, Ordering::AcqRel);
             slot.active_requests.fetch_add(1, Ordering::AcqRel);
+        });
+    }
+
+    fn adjust_prefill(&self, target: &RoutableTarget, old_tokens: u64, new_tokens: u64) {
+        self.update_or_insert(target, |slot| {
+            if new_tokens >= old_tokens {
+                slot.active_prefill_tokens
+                    .fetch_add(new_tokens - old_tokens, Ordering::AcqRel);
+            } else {
+                atomic_saturating_sub_u64(&slot.active_prefill_tokens, old_tokens - new_tokens);
+            }
         });
     }
 
@@ -945,6 +975,24 @@ mod tests {
         slots.free(&decode);
         slots.free(&decode); // duplicate cleanup saturates
         assert_eq!(slots.sample(&decode).active_requests, 0);
+    }
+
+    #[test]
+    fn request_slot_replaces_prefill_estimate_with_newer_snapshots() {
+        let manager = Arc::new(InMemorySlotManager::new());
+        let target = target("worker", 0);
+        manager.begin_prefill(&target, 100);
+        let slot = KvRequestSlot::new(manager.clone(), target.clone(), 100);
+
+        slot.update_prefill_progress(2, 60);
+        slot.update_prefill_progress(1, 90);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 60);
+
+        slot.begin_decode();
+        slot.update_prefill_progress(3, 0);
+        assert_eq!(manager.sample(&target).active_prefill_tokens, 0);
+        slot.release();
+        assert_eq!(manager.sample(&target), LoadSample::default());
     }
 
     #[test]

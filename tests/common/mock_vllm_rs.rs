@@ -128,6 +128,7 @@ impl Inference for MockVllmRs {
                 finish_info: finish,
                 ..Default::default()
             }),
+            prefill_progress: None,
         }))
     }
 
@@ -172,6 +173,7 @@ impl Inference for MockVllmRs {
                         ..Default::default()
                     }),
                     outputs: None,
+                    prefill_progress: None,
                 }))
                 .await;
             let _ = tx
@@ -189,6 +191,7 @@ impl Inference for MockVllmRs {
                         }),
                         ..Default::default()
                     }),
+                    prefill_progress: None,
                 }))
                 .await;
         });
