@@ -14,12 +14,6 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
-from vllm.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -687,12 +681,19 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session")
 def e2e_model() -> str:
+    from vllm.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+
     # Always use the default test model
     return DEFAULT_MODEL_NAME_FOR_TEST
 
 
 @pytest.fixture
 def e2e_router(e2e_model: str):
+    from vllm.test.test_utils import (
+        DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        DEFAULT_URL_FOR_TEST,
+    )
+
     # Keep this available but tests below use router-only to avoid GPU contention
     base_url = DEFAULT_URL_FOR_TEST
     proc = _popen_launch_router(

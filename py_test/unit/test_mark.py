@@ -143,8 +143,11 @@ def test_mixed_card_counts_split_one_item_per_platform(monkeypatch):
     assert rocm_skip.kwargs["reason"] == "Requires rocm platform"
 
 
-def test_normalization_fixture_is_registered():
-    from py_test import conftest
-
-    fixture_fn = getattr(conftest, HARDWARE_MARK_NORMALIZATION_FIXTURE)
-    assert fixture_fn.name == HARDWARE_MARK_NORMALIZATION_FIXTURE
+def test_normalization_fixture_is_registered(request):
+    defs = request.session._fixturemanager.getfixturedefs(
+        HARDWARE_MARK_NORMALIZATION_FIXTURE, request.node
+    )
+    assert defs
+    registered = defs[-1]
+    assert registered.argname == HARDWARE_MARK_NORMALIZATION_FIXTURE
+    assert registered.func.__module__ == "py_test.conftest"

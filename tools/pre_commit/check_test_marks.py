@@ -2,9 +2,11 @@
 """Fail if a pytest or Rust test file is missing the marks CI uses to select it.
 
 Python (``py_test/**/test_*.py``, not ``py_test/e2e``): every pytest module
-needs a ``[ci-level]`` mark (``ready``) and a machine mark. ``pytest.mark.cpu``
-is written directly. SKUs and other platforms must come from ``hardware_test``
-or ``hardware_marks`` so ``cards_{n}`` is attached.
+needs a ``[ci-level]`` mark (``ready``) and a machine mark. A module counts
+when it imports pytest or defines ``test_*`` / ``Test*`` items. Comments and
+strings do not count as marks. ``pytest.mark.cpu`` is written directly. SKUs
+and other platforms must come from ``hardware_test`` or ``hardware_marks`` so
+``cards_{n}`` is attached.
 
 Rust (``tests/*.rs`` integration crates, and ``src/**/*.rs`` that contain a
 test module): the file must name one Cargo feature tagged ``[ci-level]`` and
@@ -28,6 +30,11 @@ _DIRECT_PLATFORM_ALLOWLIST = frozenset({"cpu"})
 
 HELPER_RE = re.compile(r"(?:" + "|".join(HARDWARE_HELPERS) + r")\s*\(")
 PY_TEST_FILE_RE = re.compile(r"^py_test/(?:.*/)?(?:test_[^/]*\.py$|[^/]*_test\.py$)")
+# Pytest collects module-level test_* functions and Test* classes without
+# importing pytest. Indented test_* methods on other classes are not items.
+_TEST_ITEM_RE = re.compile(
+    r"(?m)^(?:async[ \t]+def[ \t]+test_\w+|def[ \t]+test_\w+|class[ \t]+Test\w+\b)"
+)
 RUST_INTEGRATION_RE = re.compile(r"^tests/[^/]+\.rs$")
 RUST_TEST_CFG_RE = re.compile(r"#\[\s*(?:cfg\(\s*test\b|cfg\(\s*all\(\s*test\b|test\b)")
 
@@ -75,7 +82,9 @@ def _mark_module() -> ModuleType:
 def _mark_name_re(names: tuple[str, ...]) -> re.Pattern[str]:
     if not names:
         return re.compile(r"(?!)")
-    return re.compile(r"mark\.(?:" + "|".join(re.escape(name) for name in names) + r")\b")
+    return re.compile(
+        r"mark\.(?:" + "|".join(re.escape(name) for name in names) + r")\b"
+    )
 
 
 def _feature_re(names: tuple[str, ...]) -> re.Pattern[str]:
@@ -173,7 +182,9 @@ def _source_without_comments_and_strings(contents: str) -> str:
             )
             continue
         first = lines[start_line - 1]
-        lines[start_line - 1] = first[:start_col] + _blank_keeping_newlines(first[start_col:])
+        lines[start_line - 1] = first[:start_col] + _blank_keeping_newlines(
+            first[start_col:]
+        )
         for index in range(start_line, end_line - 1):
             lines[index] = _blank_keeping_newlines(lines[index])
         lines[end_line - 1] = (
@@ -188,26 +199,28 @@ def _strip_rust_comments(contents: str) -> str:
     return re.sub(r"//.*?$", "", without_blocks, flags=re.M)
 
 
-def _is_pytest_module(contents: str) -> bool:
-    return "import pytest" in contents or "pytestmark" in contents or "@pytest" in contents
+def _is_pytest_module(scanned: str) -> bool:
+    if "import pytest" in scanned or "pytestmark" in scanned or "@pytest" in scanned:
+        return True
+    return _TEST_ITEM_RE.search(scanned) is not None
 
 
 def _python_problems(rel: str, contents: str) -> list[str]:
     if not PY_TEST_FILE_RE.match(rel) or rel.startswith("py_test/e2e/"):
         return []
-    if not _is_pytest_module(contents):
-        return []
     scanned = _source_without_comments_and_strings(contents)
+    if not _is_pytest_module(scanned):
+        return []
     missing: list[str] = []
     if rel not in _ALLOWED_DIRECT_MARK_FILES:
         if _mark_name_re(sku_names()).search(scanned):
             missing.append(DIRECT_SKU)
         if _mark_name_re(bare_platform_names()).search(scanned):
             missing.append(BARE_PLATFORM)
-    if not _mark_name_re(level_names()).search(contents):
+    if not _mark_name_re(level_names()).search(scanned):
         missing.append(MISSING_LEVEL)
-    has_machine = _mark_name_re(platform_names()).search(contents) or HELPER_RE.search(
-        contents
+    has_machine = _mark_name_re(platform_names()).search(scanned) or HELPER_RE.search(
+        scanned
     )
     if not has_machine:
         missing.append(MISSING_MACHINE)
@@ -219,8 +232,10 @@ def _is_rust_test(rel: str, contents: str) -> bool:
         return False
     if RUST_INTEGRATION_RE.match(rel):
         return True
-    return rel.startswith("src/") and rel.endswith(".rs") and bool(
-        RUST_TEST_CFG_RE.search(contents)
+    return (
+        rel.startswith("src/")
+        and rel.endswith(".rs")
+        and bool(RUST_TEST_CFG_RE.search(contents))
     )
 
 
