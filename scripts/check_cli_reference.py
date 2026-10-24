@@ -106,11 +106,25 @@ def rust_options():
         )
         if default_match:
             default = default_match[1].strip().strip('"')
-            if "::" in default:
-                variant = default.split("::")[-1]
+            if "::" in default and field_type in enums:
+                variant = default.rsplit("::", 1)[-1]
                 default = next(
                     key for key, item in enums[field_type].items() if item == variant
                 )
+            elif default.startswith("vllm_router_rs::server::"):
+                # Resolve numeric server constants used as clap defaults.
+                constant = default.rsplit("::", 1)[-1]
+                declaration = re.search(
+                    rf"^\s*pub const {re.escape(constant)}:"
+                    rf"\s*{re.escape(field_type)}\s*=\s*(\d+);",
+                    (ROOT / "src/server.rs").read_text(encoding="utf-8"),
+                    re.MULTILINE,
+                )
+                if declaration is None:
+                    raise ValueError(f"Unresolved Rust CLI default: {default}")
+                default = declaration[1]
+            elif "::" in default:
+                raise ValueError(f"Unsupported Rust CLI default: {default}")
         else:
             default = "false" if field_type == "bool" else "unset"
             if field_type.startswith("Vec<"):
