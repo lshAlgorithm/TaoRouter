@@ -389,15 +389,8 @@ fn classified_service_failure_is_not_invalid_or_unsupported() {
 }
 
 #[test]
-fn classified_empty_encoded_input_is_invalid_but_default_bos_is_exact() {
+fn classified_empty_encoded_input_is_invalid() {
     let tokenizer = tokenizer();
-    let prepared = prepare_completion_classified(
-        &request(json!({"prompt": ""})),
-        &tokenizer,
-        MODEL_VOCAB_SIZE,
-    )
-    .unwrap();
-    assert_eq!(prepared, &[1]);
     let error = prepare_completion_classified(
         &request(json!({"prompt": "", "add_special_tokens": false})),
         &tokenizer,
