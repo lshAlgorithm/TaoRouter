@@ -18,9 +18,10 @@ RUN uv venv --python 3.12 --seed /opt/vllm-router-ci/.venv
 ENV VIRTUAL_ENV=/opt/vllm-router-ci/.venv
 ENV PATH="/opt/vllm-router-ci/.venv/bin:/root/.local/bin:${PATH}"
 
-# Same packages the P/D jobs used to install on every run. L3 needs lm-eval;
-# L1 skips the eval at runtime. A CPU builder has no NVIDIA driver, so the
-# CUDA wheel check stays in the GPU job.
+# Same packages the P/D jobs used to install on every run. L1 skips lm-eval
+# at runtime. vllm and nixl are unpinned; this layer stays cached until the
+# Dockerfile or another image-build cache input changes. The GPU jobs do not
+# recheck the CUDA wheel. A bad image fails in run_accuracy_test.sh.
 RUN uv pip install vllm --torch-backend=cu130 \
     && uv pip install nixl-cu13 \
     && uv pip install nixl --no-deps \

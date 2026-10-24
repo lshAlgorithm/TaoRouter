@@ -1,7 +1,8 @@
 # L3 nightly (https://github.com/vllm-project/router/issues/273).
 # Uploaded for a default-branch push with NIGHTLY=1, or any other branch
 # labeled nightly-test. RUN_ROCM_* is decided on the ROCm jobs below.
-# Also runs the Rust and Python unit/integration jobs from test-ready.yml.
+# Also runs the Rust and Python unit/integration jobs from test-ready.yml,
+# unless that PR already has the ready label (those jobs run in L1).
 # Full NVIDIA GSM8K, the full xGMI read+write matrix, and full RDMA.
 # NIGHTLY=1 on this test pipeline does not publish images. That stays on
 # release-pipeline.yml (router-release).
@@ -19,6 +20,10 @@ env:
 steps:
   - group: ":test_tube: Tests"
     key: "nightly-tests"
+    # Skip when L1 is also uploaded. test-ready.yml runs these three jobs.
+    if: |
+      build.branch == pipeline.default_branch ||
+      !(build.pull_request.labels includes "ready")
     steps:
       - label: ":rust: Rust Unit Tests"
         plugins:
