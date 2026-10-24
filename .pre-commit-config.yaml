@@ -48,3 +48,13 @@ repos:
       - id: mypy
         files: ^py_src/.*\.py$
         additional_dependencies: ['types-requests']
+
+  # Cargo only auto-discovers tests/*.rs. Nested tests/rust/*.rs need [[test]].
+  - repo: local
+    hooks:
+      - id: check-rust-tests
+        name: check rust [[test]] registration
+        language: python
+        entry: python tools/pre_commit/check_rust_tests.py
+        files: ^(Cargo\.toml|tests/rust/[^/]+\.rs)$
+        pass_filenames: false
