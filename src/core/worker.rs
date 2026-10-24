@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use futures;
 use serde_json;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
-static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30)) // Default timeout, overridden per request
         .build()
@@ -75,6 +75,31 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
+
+    /// Monotonic timestamp (milliseconds since this process started) of the last
+    /// generation this worker completed for a real proxied request, or `0` when
+    /// none has been observed.
+    ///
+    /// Used by the observational inference probe to skip a worker that is
+    /// demonstrably serving (see [`crate::core::generation_evidence`]).
+    fn last_generation_ts(&self) -> u64 {
+        0
+    }
+
+    /// Record that this worker just returned generated tokens for a real
+    /// request. This is evidence for the inference probe's skip rule; it is not
+    /// a circuit-breaker outcome, a health change, or load accounting.
+    fn note_generation_evidence(&self) {}
+
+    /// Whether this worker produced real output within the last `window_ms`.
+    ///
+    /// A hung stream or a stalled worker stops calling
+    /// [`Self::note_generation_evidence`], so its evidence ages out and the
+    /// inference probe picks it up again on a later sweep.
+    fn has_fresh_generation_evidence(&self, window_ms: u64) -> bool {
+        let last = self.last_generation_ts();
+        last != 0 && crate::core::generation_evidence::now_millis().saturating_sub(last) < window_ms
+    }
 
     /// Check if the worker is available (healthy + circuit closed/half-open)
     fn is_available(&self) -> bool {
@@ -248,7 +273,7 @@ pub struct HealthConfig {
     pub timeout_secs: u64,
     /// Interval between health checks in seconds
     pub check_interval_secs: u64,
-    /// Health check endpoint path
+    /// Health check endpoint path, fetched with `GET`
     pub endpoint: String,
     /// Number of consecutive failures before marking unhealthy
     pub failure_threshold: u32,
@@ -293,6 +318,10 @@ pub struct BasicWorker {
     consecutive_failures: Arc<AtomicUsize>,
     consecutive_successes: Arc<AtomicUsize>,
     circuit_breaker: CircuitBreaker,
+    /// Monotonic timestamp (millis since process start) of the last proxied
+    /// request this worker answered with generated tokens; `0` = never seen.
+    /// Consulted by the observational inference probe, never by routing.
+    last_generation_ts: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -332,6 +361,7 @@ impl BasicWorker {
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
+            last_generation_ts: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -347,6 +377,13 @@ impl BasicWorker {
 
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker = CircuitBreaker::with_config(config);
+        self
+    }
+
+    /// Test helper: start a worker in the given initial health state.
+    #[cfg(test)]
+    pub fn with_initial_health(self, healthy: bool) -> Self {
+        self.healthy.store(healthy, Ordering::Release);
         self
     }
 
@@ -369,6 +406,74 @@ impl BasicWorker {
         } else {
             Ok(self.url())
         }
+    }
+}
+
+/// Run one HTTP liveness probe against a worker URL.
+///
+/// Shared by [`BasicWorker`] (no DP rank) and [`DPAwareWorker`] (pinned rank),
+/// so a DP-rank probe pins `X-data-parallel-rank` the same way a proxied user
+/// request does; otherwise every logical rank worker would probe the same
+/// unpinned base server.
+///
+/// Probe requests never touch worker load counters (see PR #216).
+///
+/// This is the *health* path: its result drives `is_healthy` and therefore
+/// routing. The real-inference check that only reports lives in
+/// [`crate::core::inference_probe`] and must not be wired in here.
+async fn http_health_probe(url: &str, cfg: &HealthConfig, dp_rank: Option<usize>) -> bool {
+    use crate::core::dp_headers::add_dp_rank_header;
+
+    let health_url = format!("{}{}", url, cfg.endpoint);
+    let mut req = WORKER_CLIENT
+        .get(&health_url)
+        .timeout(std::time::Duration::from_secs(cfg.timeout_secs));
+    if let Some(rank) = dp_rank {
+        req = add_dp_rank_header(req, Some(rank));
+    }
+    match req.send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Apply a probe outcome to a worker's consecutive-failure / -success
+/// counters and flip health status at the configured thresholds.
+///
+/// Used by both [`BasicWorker`] and [`DPAwareWorker`] (which shares the
+/// underlying `Arc` counters with its `BasicWorker`) so the threshold
+/// logic is defined in one place.
+async fn apply_health_result(worker: &BasicWorker, ok: bool) -> WorkerResult<()> {
+    if ok {
+        // Health check succeeded
+        worker.consecutive_failures.store(0, Ordering::Release);
+        let successes = worker.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Mark healthy if we've reached the success threshold
+        if !worker.is_healthy()
+            && successes >= worker.metadata().health_config.success_threshold as usize
+        {
+            worker.set_healthy(true);
+            worker.consecutive_successes.store(0, Ordering::Release);
+        }
+        Ok(())
+    } else {
+        // Health check failed
+        worker.consecutive_successes.store(0, Ordering::Release);
+        let failures = worker.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Mark unhealthy if we've reached the failure threshold
+        if worker.is_healthy()
+            && failures >= worker.metadata().health_config.failure_threshold as usize
+        {
+            worker.set_healthy(false);
+            worker.consecutive_failures.store(0, Ordering::Release);
+        }
+
+        Err(WorkerError::HealthCheckFailed {
+            url: worker.url().to_string(),
+            reason: format!("Health check failed (consecutive failures: {})", failures),
+        })
     }
 }
 
@@ -395,6 +500,17 @@ impl Worker for BasicWorker {
         RouterMetrics::set_worker_health(self.url(), healthy);
     }
 
+    fn last_generation_ts(&self) -> u64 {
+        self.last_generation_ts.load(Ordering::Acquire)
+    }
+
+    fn note_generation_evidence(&self) {
+        self.last_generation_ts.store(
+            crate::core::generation_evidence::now_millis(),
+            Ordering::Release,
+        );
+    }
+
     async fn check_health_async(&self) -> WorkerResult<()> {
         use std::time::Duration;
 
@@ -402,14 +518,7 @@ impl Worker for BasicWorker {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
-                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-
-                // Use the shared client with a custom timeout for this request
-                match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
-                }
+                http_health_probe(url, &self.metadata.health_config, None).await
             }
             ConnectionMode::Grpc => {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
@@ -419,37 +528,7 @@ impl Worker for BasicWorker {
             }
         };
 
-        if health_result {
-            // Health check succeeded
-            self.consecutive_failures.store(0, Ordering::Release);
-            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark healthy if we've reached the success threshold
-            if !self.is_healthy()
-                && successes >= self.metadata.health_config.success_threshold as usize
-            {
-                self.set_healthy(true);
-                self.consecutive_successes.store(0, Ordering::Release);
-            }
-            Ok(())
-        } else {
-            // Health check failed
-            self.consecutive_successes.store(0, Ordering::Release);
-            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark unhealthy if we've reached the failure threshold
-            if self.is_healthy()
-                && failures >= self.metadata.health_config.failure_threshold as usize
-            {
-                self.set_healthy(false);
-                self.consecutive_failures.store(0, Ordering::Release);
-            }
-
-            Err(WorkerError::HealthCheckFailed {
-                url: self.metadata.url.clone(),
-                reason: format!("Health check failed (consecutive failures: {})", failures),
-            })
-        }
+        apply_health_result(self, health_result).await
     }
 
     fn load(&self) -> usize {
@@ -528,6 +607,15 @@ impl DPAwareWorker {
         self.base_worker = self.base_worker.with_health_config(config);
         self
     }
+
+    /// Test helper: start a worker in the given initial health state.
+    #[cfg(test)]
+    pub fn with_initial_health(self, healthy: bool) -> Self {
+        Self {
+            base_worker: self.base_worker.with_initial_health(healthy),
+            ..self
+        }
+    }
 }
 
 #[async_trait]
@@ -552,9 +640,39 @@ impl Worker for DPAwareWorker {
         self.base_worker.set_healthy(healthy);
     }
 
+    fn last_generation_ts(&self) -> u64 {
+        self.base_worker.last_generation_ts()
+    }
+
+    fn note_generation_evidence(&self) {
+        self.base_worker.note_generation_evidence();
+    }
+
     async fn check_health_async(&self) -> WorkerResult<()> {
-        // Delegate to the base worker's health check logic
-        self.base_worker.check_health_async().await
+        use std::time::Duration;
+
+        let health_result = match &self.base_worker.metadata().connection_mode {
+            ConnectionMode::Http => {
+                let url = self.base_worker.normalised_url()?;
+                http_health_probe(
+                    url,
+                    &self.base_worker.metadata().health_config,
+                    Some(self.dp_rank),
+                )
+                .await
+            }
+            ConnectionMode::Grpc => {
+                let timeout =
+                    Duration::from_secs(self.base_worker.metadata().health_config.timeout_secs);
+                crate::backend::check_grpc_health(self.url(), timeout)
+                    .await
+                    .is_ok()
+            }
+        };
+
+        // Share the threshold logic with BasicWorker; both drive the same
+        // underlying Arc counters on base_worker.
+        apply_health_result(&self.base_worker, health_result).await
     }
 
     fn load(&self) -> usize {
@@ -1732,6 +1850,154 @@ mod tests {
         assert_eq!(dp_worker.processed_requests(), 0);
         dp_worker.increment_processed();
         assert_eq!(dp_worker.processed_requests(), 1);
+    }
+
+    /// A DP-aware worker's health check must pin the logical rank it stands for.
+    ///
+    /// Without `X-data-parallel-rank` the probe lands on whichever engine the
+    /// worker happens to pick, so one bad rank can be reported as healthy (or a
+    /// good one as failing) and the health checker flips the wrong unit. The
+    /// threshold bookkeeping that acts on the probe is asserted alongside it,
+    /// because pinning the rank must not change when health flips.
+    #[tokio::test]
+    async fn test_dp_aware_health_check_pins_rank_and_applies_thresholds() {
+        use axum::response::IntoResponse;
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc as StdArc;
+
+        /// Sentinel for "the probe carried no rank header at all".
+        const NO_RANK: usize = usize::MAX;
+
+        struct MockHealth {
+            healthy: AtomicBool,
+            rank_header: AtomicUsize,
+            hits: AtomicUsize,
+        }
+
+        async fn health_handler(
+            State(mock): State<StdArc<MockHealth>>,
+            headers: HeaderMap,
+        ) -> axum::response::Response {
+            mock.hits.fetch_add(1, Ordering::SeqCst);
+            let rank = headers
+                .get("X-data-parallel-rank")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(NO_RANK);
+            mock.rank_header.store(rank, Ordering::SeqCst);
+
+            if mock.healthy.load(Ordering::SeqCst) {
+                StatusCode::OK.into_response()
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+
+        let mock = StdArc::new(MockHealth {
+            healthy: AtomicBool::new(true),
+            rank_header: AtomicUsize::new(NO_RANK),
+            hits: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        const RANK: usize = 3;
+        let worker = DPAwareWorker::new(
+            format!("http://127.0.0.1:{}", port),
+            RANK,
+            4,
+            WorkerType::Regular,
+        )
+        .with_health_config(HealthConfig {
+            timeout_secs: 5,
+            check_interval_secs: 1,
+            endpoint: "/health".to_string(),
+            failure_threshold: 2,
+            success_threshold: 2,
+        });
+        assert!(worker.is_healthy(), "a worker starts healthy");
+
+        // (a) The probe reaches `/health` and carries this worker's rank.
+        assert!(worker.check_health_async().await.is_ok());
+        assert_eq!(
+            mock.rank_header.load(Ordering::SeqCst),
+            RANK,
+            "the DP-aware health probe must pin X-data-parallel-rank to its rank"
+        );
+
+        // (b) Threshold bookkeeping still flips health exactly at the
+        // configured thresholds.
+        mock.healthy.store(false, Ordering::SeqCst);
+        assert!(worker.check_health_async().await.is_err());
+        assert!(
+            worker.is_healthy(),
+            "one failure must not flip health at failure_threshold=2"
+        );
+        assert!(worker.check_health_async().await.is_err());
+        assert!(
+            !worker.is_healthy(),
+            "two consecutive failures must mark the worker unhealthy"
+        );
+
+        mock.healthy.store(true, Ordering::SeqCst);
+        assert!(worker.check_health_async().await.is_ok());
+        assert!(
+            !worker.is_healthy(),
+            "one success must not flip health at success_threshold=2"
+        );
+        assert!(worker.check_health_async().await.is_ok());
+        assert!(
+            worker.is_healthy(),
+            "two consecutive successes must mark the worker healthy again"
+        );
+        assert!(
+            mock.hits.load(Ordering::SeqCst) >= 5,
+            "every probe must reach /health"
+        );
+    }
+
+    /// The inference probe's skip rule depends on this contract: no evidence
+    /// until a real generation is noted, fresh evidence while inside the window,
+    /// and expiry once the window passes — that expiry is what lets a stalled
+    /// worker be probed again instead of being skipped forever.
+    #[tokio::test]
+    async fn test_generation_evidence_is_fresh_only_while_it_is_recent() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        assert_eq!(worker.last_generation_ts(), 0, "no generation seen yet");
+        assert!(
+            !worker.has_fresh_generation_evidence(60_000),
+            "a worker that never served must not be skipped by the probe"
+        );
+
+        worker.note_generation_evidence();
+        assert!(worker.last_generation_ts() > 0);
+        assert!(
+            worker.has_fresh_generation_evidence(60_000),
+            "evidence inside the window must qualify the worker for a skip"
+        );
+        assert!(
+            !worker.has_fresh_generation_evidence(0),
+            "a zero-length window must not count anything as fresh"
+        );
+
+        // Recording again must not move the evidence clock backwards.
+        let first = worker.last_generation_ts();
+        worker.note_generation_evidence();
+        assert!(worker.last_generation_ts() >= first);
     }
 
     // ===== Tests for WorkerFactory async methods =====

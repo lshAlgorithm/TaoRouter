@@ -70,6 +70,36 @@ pub fn init_metrics() {
     );
     describe_gauge!("vllm_router_worker_load", "Current load on each worker");
     describe_counter!(
+        "vllm_router_worker_inference_probe_total",
+        "Observational one-token inference probes by worker and result \
+         (result=fresh_traffic means the sweep was skipped because the worker \
+         served a real generation within the interval). These probes never \
+         affect routing health"
+    );
+    describe_gauge!(
+        "vllm_router_worker_inference_ok",
+        "Last observational inference probe result per worker (1=completed a generation or was \
+         skipped as fresh_traffic, 0=failed)"
+    );
+    // Freshness signal for removed workers: the Prometheus side should alert
+    // on `vllm_router_worker_inference_ok == 0` qualified by a recency window
+    // on this gauge (e.g. `AND on(worker) vllm_router_worker_inference_last_probe_ts > time() - 5*interval`).
+    // A worker dropped from the registry (e.g. service discovery replaced a
+    // failed pod) stops being swept — and `retire_inference_probe` explicitly
+    // zeroes this gauge on removal — so the alert stops firing on the orphaned
+    // 0-value series.
+    describe_gauge!(
+        "vllm_router_worker_inference_last_probe_ts",
+        "Unix timestamp (seconds) of the last observational inference probe \
+         issued to each worker (or, for a skipped sweep, of the real \
+         generation that qualified it); 0 once the worker is removed. Used to \
+         tell active workers' gauges apart from those orphaned by removal"
+    );
+    describe_histogram!(
+        "vllm_router_worker_inference_probe_latency_ms",
+        "Latency of observational one-token inference probes in milliseconds"
+    );
+    describe_counter!(
         "vllm_router_processed_requests_total",
         "Total requests processed by each worker"
     );
@@ -568,6 +598,72 @@ impl RouterMetrics {
         .set(load as f64);
     }
 
+    /// Record the outcome of an observational inference probe.
+    ///
+    /// This is a report only: it deliberately does not touch
+    /// `vllm_router_worker_health` or any routing state. `reason` is a short
+    /// label-safe classifier, not the full error text.
+    pub fn record_inference_probe(worker_url: &str, ok: bool, reason: &str, latency_ms: u128) {
+        let result = if ok { "ok" } else { reason };
+        counter!("vllm_router_worker_inference_probe_total",
+            "worker" => worker_url.to_string(),
+            "result" => result.to_string()
+        )
+        .increment(1);
+        gauge!("vllm_router_worker_inference_ok",
+            "worker" => worker_url.to_string()
+        )
+        .set(if ok { 1.0 } else { 0.0 });
+        stamp_inference_probe_freshness(worker_url);
+        if ok {
+            histogram!("vllm_router_worker_inference_probe_latency_ms",
+                "worker" => worker_url.to_string()
+            )
+            .record(latency_ms as f64);
+        }
+    }
+
+    /// Record a sweep that was skipped because the worker is demonstrably
+    /// serving real traffic (see [`crate::core::generation_evidence`]).
+    ///
+    /// This is *not* a silent skip: the worker is reported as ok — its
+    /// `vllm_router_worker_inference_ok` is set to `1` and its freshness
+    /// timestamp is refreshed exactly as a passing probe would — while the
+    /// counter's `result` label records `fresh_traffic` so a real probe result
+    /// and a skip stay distinguishable.
+    ///
+    /// Skipping silently would give `last_probe_ts` a second meaning and could
+    /// leave a stale `inference_ok=0` on a worker that failed a probe and then
+    /// resumed serving.
+    pub fn record_inference_probe_fresh_traffic(worker_url: &str) {
+        counter!("vllm_router_worker_inference_probe_total",
+            "worker" => worker_url.to_string(),
+            "result" => "fresh_traffic"
+        )
+        .increment(1);
+        gauge!("vllm_router_worker_inference_ok",
+            "worker" => worker_url.to_string()
+        )
+        .set(1.0);
+        stamp_inference_probe_freshness(worker_url);
+    }
+
+    /// Expire the inference-probe freshness signal for a worker that left the
+    /// registry.
+    ///
+    /// `metrics-exporter-prometheus` 0.17 exposes no series-removal API, so an
+    /// orphaned `vllm_router_worker_inference_ok == 0` cannot be deleted. It can
+    /// be *retired*: zeroing the freshness timestamp takes the series out of
+    /// the recency window the documented alert expression qualifies on, so a
+    /// failed pod that was replaced stops paging immediately instead of after
+    /// the alert's staleness grace period.
+    pub fn retire_inference_probe(worker_url: &str) {
+        gauge!("vllm_router_worker_inference_last_probe_ts",
+            "worker" => worker_url.to_string()
+        )
+        .set(0.0);
+    }
+
     pub fn record_processed_request(worker_url: &str) {
         counter!("vllm_router_processed_requests_total",
             "worker" => worker_url.to_string()
@@ -908,6 +1004,23 @@ impl RouterMetrics {
         )
         .increment(1);
     }
+}
+
+/// Stamp the inference-probe freshness gauge for a worker.
+///
+/// This deliberately stays a Unix wall-clock timestamp: operators compare it
+/// against Prometheus' `time()`, and `retire_inference_probe` uses `0` as the
+/// "no longer swept" sentinel. The probe's *evidence* clock is monotonic and
+/// lives in [`crate::core::generation_evidence`].
+fn stamp_inference_probe_freshness(worker_url: &str) {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    gauge!("vllm_router_worker_inference_last_probe_ts",
+        "worker" => worker_url.to_string()
+    )
+    .set(now_secs as f64);
 }
 
 impl TokenizerMetrics {

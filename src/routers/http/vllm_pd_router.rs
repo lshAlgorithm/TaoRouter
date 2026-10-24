@@ -18,6 +18,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -624,6 +625,28 @@ impl VllmPDRouter {
             .collect()
     }
 
+    /// Best-effort lookup of the registered worker behind a P/D instance
+    /// address, used only to credit generation evidence.
+    ///
+    /// Service discovery carries bare `host:port` addresses while
+    /// [`crate::core::WorkerRegistry`] keys workers by full URL, so both
+    /// spellings are tried. A miss is harmless: it simply means the worker is
+    /// not credited this time and the next inference-probe sweep probes it.
+    fn find_registered_worker(&self, addr: &str) -> Option<Arc<dyn Worker>> {
+        let registry = &self.pd_router.worker_registry;
+        if let Some(worker) = registry.get_by_url(addr) {
+            return Some(worker);
+        }
+        if !addr.starts_with("http://") && !addr.starts_with("https://") {
+            if let Some(worker) = registry.get_by_url(&format!("http://{}", addr)) {
+                return Some(worker);
+            }
+        }
+        addr.strip_prefix("http://")
+            .or_else(|| addr.strip_prefix("https://"))
+            .and_then(|bare| registry.get_by_url(bare))
+    }
+
     /// Select worker using policy-based load balancing
     fn select_worker_with_policy(
         &self,
@@ -791,6 +814,17 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
+        // Generation evidence (see `crate::core::generation_evidence`): in a P/D
+        // pair the decode worker is the one that generated the tokens this
+        // proxied response carries, so it — not the prefill peer — is credited
+        // when the body demonstrably shows output. This only records; it never
+        // touches health, the circuit breaker, or load accounting.
+        let evidence_worker = decode_response
+            .status()
+            .is_success()
+            .then(|| self.find_registered_worker(decode_base_http))
+            .flatten();
+
         if needs_logprobs && !is_streaming {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
@@ -800,6 +834,12 @@ impl VllmPDRouter {
                 .bytes()
                 .await
                 .map_err(|e| format!("Failed to read decode response: {}", e))?;
+
+            if crate::core::body_shows_generated_tokens(&decode_body) {
+                if let Some(worker) = &evidence_worker {
+                    worker.note_generation_evidence();
+                }
+            }
 
             let mut decode_json: Value = serde_json::from_slice(&decode_body)
                 .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
@@ -840,7 +880,23 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            // Latch: one bounded scan per response, and only a chunk that itself
+            // shows generated tokens credits the worker. A stream that dies
+            // early never qualifies it.
+            let mut evidenced = false;
+            let body = axum::body::Body::from_stream(decode_response.bytes_stream().inspect(
+                move |chunk| {
+                    if evidenced {
+                        return;
+                    }
+                    if let (Ok(bytes), Some(worker)) = (chunk, &evidence_worker) {
+                        if crate::core::body_shows_generated_tokens(bytes) {
+                            worker.note_generation_evidence();
+                            evidenced = true;
+                        }
+                    }
+                },
+            ));
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -855,6 +911,11 @@ impl VllmPDRouter {
             .bytes()
             .await
             .map_err(|e| format!("Failed to read decode response: {}", e))?;
+        if crate::core::body_shows_generated_tokens(&body) {
+            if let Some(worker) = &evidence_worker {
+                worker.note_generation_evidence();
+            }
+        }
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in decode_headers.iter() {
             response_builder = response_builder.header(name, value);
@@ -1705,6 +1766,13 @@ impl VllmPDRouter {
                         ),
                     })?;
 
+            // Generation evidence: the decode worker produced this proxied
+            // response body (see `crate::core::generation_evidence`). Recording
+            // only — never health, circuit breaker, or load accounting.
+            if crate::core::body_shows_generated_tokens(&decode_body) {
+                decode_worker.note_generation_evidence();
+            }
+
             // Parse decode response as JSON
             let mut decode_json: Value =
                 serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
@@ -1752,7 +1820,22 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            // Latch: one bounded scan per response; only a chunk carrying
+            // generated tokens credits the decode worker, so a stream that dies
+            // early never qualifies it.
+            let mut evidenced = false;
+            let evidence_worker = decode_worker.clone();
+            let body = Body::from_stream(decode_response.bytes_stream().inspect(move |chunk| {
+                if evidenced {
+                    return;
+                }
+                if let Ok(bytes) = chunk {
+                    if crate::core::body_shows_generated_tokens(bytes) {
+                        evidence_worker.note_generation_evidence();
+                        evidenced = true;
+                    }
+                }
+            }));
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {

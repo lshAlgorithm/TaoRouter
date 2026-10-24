@@ -61,6 +61,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         disable_retries: true,
         disable_circuit_breaker: true,
         health_check: vllm_router_rs::config::HealthCheckConfig::default(),
+        inference_probe: vllm_router_rs::config::InferenceProbeConfig::default(),
         enable_igw: false,
         connection_mode: ConnectionMode::Http,
         history_backend: HistoryBackend::Memory,

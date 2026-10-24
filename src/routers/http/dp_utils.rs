@@ -180,6 +180,12 @@ pub fn parse_worker_url(worker_url: &str) -> (String, Option<usize>) {
 ///
 /// This is a utility function to standardize how DP rank headers are added to HTTP requests.
 ///
+/// The implementation lives in [`crate::core::dp_headers`] because the core
+/// probe paths (health check, observational inference probe) need the same
+/// header as the router proxy paths; re-exporting it here keeps every
+/// `dp_utils::add_dp_rank_header(...)` call site working without a
+/// `core → routers` dependency.
+///
 /// # Arguments
 /// * `request` - The reqwest RequestBuilder to add headers to
 /// * `dp_rank` - Optional DP rank to add as a header
@@ -196,15 +202,7 @@ pub fn parse_worker_url(worker_url: &str) -> (String, Option<usize>) {
 /// request = add_dp_rank_header(request, Some(3));
 /// // Request now has "X-data-parallel-rank: 3" header
 /// ```
-pub fn add_dp_rank_header(
-    mut request: reqwest::RequestBuilder,
-    dp_rank: Option<usize>,
-) -> reqwest::RequestBuilder {
-    if let Some(rank) = dp_rank {
-        request = request.header("X-data-parallel-rank", rank.to_string());
-    }
-    request
-}
+pub use crate::core::dp_headers::{add_dp_rank_header, DP_RANK_HEADER};
 
 #[cfg(test)]
 mod tests {

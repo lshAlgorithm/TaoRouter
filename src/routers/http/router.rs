@@ -1719,10 +1719,10 @@ impl Router {
             }
         }
 
-        // Add X-data-parallel-rank header for DP-aware routing
-        if let Some(dp_rank) = extracted_dp_rank {
-            request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
-        }
+        // Pin the logical DP rank for this attempt. Shared with the core probe
+        // paths so the header name cannot drift between proxy and probe
+        // (see `crate::core::dp_headers`).
+        request_builder = dp_utils::add_dp_rank_header(request_builder, extracted_dp_rank);
 
         // Opt-in: VLLM_ROUTER_STAGES=1. HTTP remains a transparent proxy; the
         // stage split reports worker header wait and first SSE byte only.
@@ -1760,6 +1760,18 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
+        // Generation evidence (see `crate::core::generation_evidence`): when this
+        // proxied request demonstrably returns generated tokens, the worker is
+        // credited and the next observational inference probe can skip it.
+        // Resolved once here so the streaming relays below do not pay a registry
+        // lookup per chunk. A non-2xx response is never evidence. This touches
+        // neither health, nor the circuit breaker, nor load accounting.
+        let evidence_worker = if status.is_success() {
+            self.worker_registry.get_by_url(worker_url)
+        } else {
+            None
+        };
+
         if !is_stream {
             // For non-streaming requests, preserve headers
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1774,6 +1786,11 @@ impl Router {
                 Ok(body) => {
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
+                    }
+                    if crate::core::body_shows_generated_tokens(&body) {
+                        if let Some(worker) = &evidence_worker {
+                            worker.note_generation_evidence();
+                        }
                     }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
@@ -1817,6 +1834,10 @@ impl Router {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
+                // Latch: the worker is credited at most once per response, and
+                // only for a chunk that itself shows generated tokens. A stream
+                // that dies before producing output never qualifies.
+                let mut evidenced = false;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -1831,6 +1852,14 @@ impl Router {
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
+                            }
+                            if !evidenced {
+                                if let Some(worker) = &evidence_worker {
+                                    if crate::core::body_shows_generated_tokens(&bytes) {
+                                        worker.note_generation_evidence();
+                                        evidenced = true;
+                                    }
+                                }
                             }
                             // Check for stream end marker
                             if bytes
@@ -1888,6 +1917,9 @@ impl Router {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
+                // Latch: at most one credit per response (see the sibling relay
+                // above); an early stream death leaves the worker uncredited.
+                let mut evidenced = false;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -1901,6 +1933,14 @@ impl Router {
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
+                            }
+                            if !evidenced {
+                                if let Some(worker) = &evidence_worker {
+                                    if crate::core::body_shows_generated_tokens(&bytes) {
+                                        worker.note_generation_evidence();
+                                        evidenced = true;
+                                    }
+                                }
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 stream_succeeded = false;
@@ -2888,9 +2928,32 @@ impl RouterTrait for Router {
                     }
                 }
 
+                // Generation evidence (see `crate::core::generation_evidence`):
+                // a 2xx proxied response that carries generated tokens credits
+                // the worker, so the next observational inference probe may skip
+                // it. `worker` itself is consumed by load release below, hence
+                // the clone. Never touches health, circuit breaker, or load.
+                let evidence_worker = status.is_success().then(|| worker.clone());
+
                 if Self::should_proxy_transparent_directly(program_completion.is_some()) {
+                    // Transparent passthrough is the default proxy path: the body
+                    // is never buffered, so evidence is latched from the
+                    // forwarded chunks in flight (one bounded scan per response).
+                    let mut evidenced = false;
+                    let evidence_worker = evidence_worker.clone();
+                    let stream = response.bytes_stream().inspect(move |chunk| {
+                        if evidenced {
+                            return;
+                        }
+                        if let (Ok(bytes), Some(worker)) = (chunk, &evidence_worker) {
+                            if crate::core::body_shows_generated_tokens(bytes) {
+                                worker.note_generation_evidence();
+                                evidenced = true;
+                            }
+                        }
+                    });
                     response_builder
-                        .body(Body::from_stream(response.bytes_stream()))
+                        .body(Body::from_stream(stream))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2908,6 +2971,11 @@ impl RouterTrait for Router {
                                 if let Some(completion) = &program_completion {
                                     completion.observe_json(&bytes);
                                     completion.finish(true);
+                                }
+                                if let Some(worker) = &evidence_worker {
+                                    if crate::core::body_shows_generated_tokens(&bytes) {
+                                        worker.note_generation_evidence();
+                                    }
                                 }
                             }
                             response_builder
@@ -2937,6 +3005,8 @@ impl RouterTrait for Router {
                     let stream = response.bytes_stream();
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
+                    let mut evidenced = false;
+                    let evidence_worker = evidence_worker.clone();
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let mut stream_ok = true;
@@ -2945,6 +3015,14 @@ impl RouterTrait for Router {
                                 Ok(bytes) => {
                                     if let Some(completion) = &completion {
                                         completion.observe_sse_chunk(&bytes);
+                                    }
+                                    if !evidenced {
+                                        if let Some(worker) = &evidence_worker {
+                                            if crate::core::body_shows_generated_tokens(&bytes) {
+                                                worker.note_generation_evidence();
+                                                evidenced = true;
+                                            }
+                                        }
                                     }
                                     if tx.send(Ok(bytes)).is_err() {
                                         stream_ok = false;

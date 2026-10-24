@@ -565,6 +565,7 @@ mod test_pd_routing {
                 disable_retries: false,
                 disable_circuit_breaker: false,
                 health_check: vllm_router_rs::config::HealthCheckConfig::default(),
+                inference_probe: vllm_router_rs::config::InferenceProbeConfig::default(),
                 program_scheduling: None,
                 enable_igw: false,
                 rate_limit_tokens_per_second: None,
