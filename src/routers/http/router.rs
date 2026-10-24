@@ -223,15 +223,20 @@ fn hold_request_load_with_output_frame(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+struct CompletionRoute<'a> {
+    tokens: Option<Vec<u32>>,
+    raw_body: Option<&'a axum::body::Bytes>,
+    echo: bool,
+}
+
 struct TypedDispatch<'a> {
     headers: Option<&'a HeaderMap>,
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
-    completion_echo: Option<bool>,
+    completion: Option<&'a CompletionRoute<'a>>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedChat>,
-    raw_body: Option<&'a axum::body::Bytes>,
 }
 
 struct SelectedWorker {
@@ -1324,6 +1329,55 @@ impl Router {
             .await
     }
 
+    fn prepare_completion_route<'a>(
+        &self,
+        request: &CompletionRequest,
+        raw_body: Option<&'a axum::body::Bytes>,
+        model_id: Option<&str>,
+    ) -> Result<CompletionRoute<'a>, (StatusCode, String)> {
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let tokens = match self.completion_input.as_ref() {
+            Some(input)
+                if kv_aware_ops(policy.as_ref()).is_some()
+                    && request
+                        .model
+                        .as_deref()
+                        .is_none_or(|model| model == input.model) =>
+            {
+                match crate::backend::prepare_completion_classified(
+                    request,
+                    input.tokenizer.as_ref(),
+                    input.vocab_size,
+                ) {
+                    Ok(tokens) => {
+                        debug!(token_count = tokens.len(), "Completion input prepared once");
+                        Some(tokens)
+                    }
+                    Err(crate::backend::CompletionPreparationError::Unsupported(_)) => {
+                        debug!("Completion input uses ordinary fallback");
+                        None
+                    }
+                    Err(crate::backend::CompletionPreparationError::InvalidRequest(error)) => {
+                        return Err((StatusCode::BAD_REQUEST, error));
+                    }
+                    Err(crate::backend::CompletionPreparationError::ServiceFailure(error)) => {
+                        return Err((StatusCode::SERVICE_UNAVAILABLE, error));
+                    }
+                }
+            }
+            _ => None,
+        };
+        // Fallback drops only input credit, not the original body or output contract.
+        Ok(CompletionRoute {
+            tokens,
+            raw_body,
+            echo: request.echo,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn route_prepared_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
@@ -1336,7 +1390,6 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let completion_echo = completion.map(|request| request.echo);
 
         // Re-check live URLs. Mix is rejected at init / add_worker; this
         // catches a registry that somehow became mixed.
@@ -1393,53 +1446,25 @@ impl Router {
             None
         };
 
-        let effective_policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-        let completion: Option<Vec<u32>> = match (
-            completion.filter(|_| kv_aware_ops(effective_policy.as_ref()).is_some()),
-            self.completion_input.as_ref(),
-        ) {
-            (Some(request), Some(input))
-                if request
-                    .model
-                    .as_deref()
-                    .is_none_or(|model| model == input.model) =>
-            {
-                match crate::backend::prepare_completion_classified(
-                    request,
-                    input.tokenizer.as_ref(),
-                    input.vocab_size,
-                ) {
-                    Ok(prepared) => {
-                        debug!(
-                            token_count = prepared.len(),
-                            "Completion input prepared once"
-                        );
-                        Some(prepared)
-                    }
-                    Err(crate::backend::CompletionPreparationError::Unsupported(_)) => {
-                        debug!("Completion input uses ordinary fallback");
-                        None
-                    }
-                    Err(crate::backend::CompletionPreparationError::InvalidRequest(error)) => {
-                        return (StatusCode::BAD_REQUEST, error).into_response()
-                    }
-                    Err(crate::backend::CompletionPreparationError::ServiceFailure(error)) => {
-                        return (StatusCode::SERVICE_UNAVAILABLE, error).into_response()
-                    }
-                }
-            }
-            _ => None,
+        let completion = match completion
+            .map(|request| self.prepare_completion_route(request, raw_body, model_id))
+            .transpose()
+        {
+            Ok(completion) => completion,
+            Err(error) => return error.into_response(),
         };
         let token_ids = prepared
             .as_ref()
             .map(|prepared| prepared.tokenized.token_ids.as_ref())
-            .or(completion.as_deref());
+            .or_else(|| {
+                completion
+                    .as_ref()
+                    .and_then(|input| input.tokens.as_deref())
+            });
         let text = typed_req.extract_text_for_routing();
         let text = &text;
         let prepared = &prepared;
+        let completion = completion.as_ref();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1538,10 +1563,9 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
-                            completion_echo,
+                            completion,
                             load,
                             prepared: (*prepared).clone(),
-                            raw_body,
                         },
                         program_completion.clone(),
                     )
@@ -1718,11 +1742,12 @@ impl Router {
             route,
             worker_url,
             is_stream,
-            completion_echo,
+            completion,
             load,
             prepared,
-            raw_body,
         } = dispatch;
+        let completion_echo = completion.map(|input| input.echo);
+        let raw_body = completion.and_then(|input| input.raw_body);
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers are chat-only in this milestone. Reject unsupported
@@ -4155,6 +4180,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_completion_stream_keeps_raw_body_and_output_lifecycle() {
+        for echo in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            ));
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(worker.clone());
+            router.policy_registry =
+                Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                }));
+            router.completion_input = Some(crate::backend::completion_input::CompletionInput {
+                model: "qwen3".into(),
+                cache_model: "qwen3".into(),
+                vocab_size: 16,
+                tokenizer: Arc::new(
+                    vllm_tokenizer::HuggingFaceTokenizer::new_hf(
+                        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures/tokenizer/completion_word_level.json"),
+                    )
+                    .unwrap(),
+                ),
+            });
+            let policy = router.policy_registry.get_default_policy();
+            let kv = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .unwrap();
+            let manager = kv.slot_manager().unwrap();
+            let target = kv.target_for_worker(worker.as_ref());
+            let raw = bytes::Bytes::from(format!(
+                " {{ \"prompt\": \"hello world\", \"cache_salt\": \"tenant\", \"stream\": true, \"echo\": {echo} }}\n"
+            ));
+            let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+            let (tx, rx) =
+                tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+            let receiver = Arc::new(Mutex::new(Some(rx)));
+            let expected = raw.clone();
+            let app = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(move |body: axum::body::Bytes| {
+                    assert_eq!(body, expected);
+                    let rx = receiver.lock().take().unwrap();
+                    async move { Response::new(Body::from_stream(UnboundedReceiverStream::new(rx))) }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                router.route_completion_raw(None, &request, &raw, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            for chunk in [
+                b": comment containing data: [DONE]\n\n".as_slice(),
+                b"data: {\"choices\":[{\"text\":\"output or echo\"}]}\n\n".as_slice(),
+            ] {
+                tx.send(Ok(bytes::Bytes::from_static(chunk))).unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(5), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(received.ends_with(chunk));
+                assert_eq!(
+                    worker.load(),
+                    1,
+                    "fallback must retain Completion observation"
+                );
+                assert_eq!(
+                    manager.sample(&target),
+                    crate::policies::LoadSample {
+                        active_prefill_tokens: 0,
+                        active_requests: 1,
+                    },
+                    "Unsupported has no token credit, but its request remains active"
+                );
+            }
+            drop(body);
+            assert_eq!(worker.load(), 0);
+            assert_eq!(
+                manager.sample(&target),
+                crate::policies::LoadSample::default()
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn http_completion_stream_requires_complete_model_output() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
@@ -4188,6 +4310,11 @@ mod tests {
             "prompt": [1], "stream": true, "echo": false,
         }))
         .unwrap();
+        let completion = CompletionRoute {
+            tokens: None,
+            raw_body: None,
+            echo: request.echo,
+        };
         let router = create_test_regular_router();
         let response = router
             .send_typed_request(
@@ -4197,10 +4324,9 @@ mod tests {
                     route: "/v1/completions",
                     worker_url: worker.url(),
                     is_stream: true,
-                    completion_echo: Some(request.echo),
+                    completion: Some(&completion),
                     load,
                     prepared: None,
-                    raw_body: None,
                 },
                 None,
             )
@@ -4382,6 +4508,11 @@ mod tests {
                 serde_json::json!({ "prompt": [1], "stream": true, "echo": echo }),
             )
             .unwrap();
+            let completion = CompletionRoute {
+                tokens: None,
+                raw_body: None,
+                echo,
+            };
             let response = create_test_regular_router()
                 .send_typed_request(
                     &request,
@@ -4390,10 +4521,9 @@ mod tests {
                         route: "/v1/completions",
                         worker_url: worker.url(),
                         is_stream: true,
-                        completion_echo: Some(request.echo),
+                        completion: Some(&completion),
                         load,
                         prepared: None,
-                        raw_body: None,
                     },
                     None,
                 )
