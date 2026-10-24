@@ -14,7 +14,7 @@ Both install an executable named `vllm-router`. Check which executable is on
 your `PATH` before copying flags between installations. Their options are
 similar, but they are not interchangeable. In particular:
 
-- Rust accepts `rendezvous_hash`; Python does not. Rust also exposes backend
+- Rust accepts `rendezvous_hash`; Python does not. Both support `kv_aware` for the regular routing policy, but not for prefill/decode policies. Rust also exposes backend
   selection, tracing, API-key validation URLs, history storage and profiling.
 - Python exposes `--mini-lb`, queue settings and the token bucket refill rate.
   The Rust CLI fixes queue size at `100`, queue timeout at `60` seconds, and
@@ -37,6 +37,8 @@ clap's implicit append action. Put non-repeatable list values after one flag.
 Rust rejects repeated scalar options; Python keeps the last value for scalar
 and non-append list options.
 
+The Rust HTTP backend connection pool has a two-second idle timeout by default; `--pool-idle-timeout-secs 0` disables reuse. This is a Rust-only CLI option.
+
 Rust integer types are unsigned: `u16` is 0–65535, `u32` is 0–4294967295,
 `u64` is 0–18446744073709551615, and `usize` depends on the target pointer
 width. `f32` and `f64` are floating-point values. Python's `integer` and
@@ -52,6 +54,7 @@ width. `f32` and `f64` are floating-point values. Python's `integer` and
 | `--version` | `flag` | `n/a` | — | — | Print the Rust binary version and exit; `-V` is also accepted. |
 | `--max-payload-size` | `usize` | `536870912` | `integer` | `536870912` | Maximum request body size in bytes; the default is 512 MiB. |
 | `--request-timeout-secs` | `u64` | `1800` | `integer` | `1800` | Request timeout in seconds. |
+| `--pool-idle-timeout-secs` | `u64` | `2` | — | — | Idle lifetime for pooled backend HTTP connections in seconds; 0 disables reuse. |
 | `--max-concurrent-requests` | `usize` | `32768` | `integer` | `32768` | Token bucket capacity for request admission; does not enforce a hard limit on in-flight requests. |
 | `--queue-size` | — | — | `integer` | `100` | Pending request queue capacity; `0` disables queuing and returns 429 when full. |
 | `--queue-timeout-secs` | — | — | `integer` | `60` | Maximum time in seconds spent waiting in the request queue. |
@@ -90,9 +93,13 @@ and the Rust OpenAI backend use different configuration paths. See
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, power_of_two, consistent_hash` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
+| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
 | `--prefill-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash` | `unset` | PD prefill policy; unset inherits `--policy`. |
 | `--decode-policy` | `random, round_robin, cache_aware, power_of_two, consistent_hash, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, power_of_two, consistent_hash` | `unset` | PD decode policy; unset inherits `--policy`. |
+| `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | Softmax temperature for regular-mode kv_aware routing; zero selects the minimum-cost worker. |
+| `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
+| `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | External-tier KV transfer credit for kv_aware. |
+| `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |
 | `--balance-rel-threshold` | `f32` | `1.5` | `float` | `1.5` | Cache-aware load balancing relative threshold; used together with the absolute threshold. |
@@ -116,6 +123,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
+| `--epd-config` | `string` | `unset` | — | — | JSON encoder orchestration configuration for Rust E+PD or E/P/D routing. |
 | `--vllm-pd-disaggregation` | `flag` | `false` | `flag` | `false` | Enable vLLM prefill/decode (PD) routing. |
 | `--prefill` | `URL [PORT or none] (repeatable)` | `[]` | `string [1..] (repeatable)` | `unset` | Add one prefill URL and optional bootstrap port: `--prefill URL [PORT]`. Omit the port or pass `none` for no bootstrap port. |
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
