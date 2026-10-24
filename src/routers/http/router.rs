@@ -1,5 +1,5 @@
 use super::program_adapter::ProgramCompletion;
-use crate::backend::stream_output::OutputFrameConsumer;
+use crate::backend::{stream_output::OutputFrameConsumer, PrepareError};
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -16,7 +16,8 @@ use crate::program_scheduling::{
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
+    ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -43,6 +44,13 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+fn prepare_error_status(error: &PrepareError) -> StatusCode {
+    match error {
+        PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
+    }
+}
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
@@ -230,7 +238,7 @@ struct TypedDispatch<'a> {
     worker_url: &'a str,
     is_stream: bool,
     load: RequestLoadGuard,
-    prepared: Option<crate::backend::PreparedChat>,
+    prepared: Option<crate::backend::PreparedRequest>,
 }
 
 struct SelectedWorker {
@@ -1192,7 +1200,7 @@ impl Router {
     }
 
     fn prepared_cache_identity(
-        prepared: Option<&crate::backend::PreparedChat>,
+        prepared: Option<&crate::backend::PreparedRequest>,
     ) -> (Option<&str>, Option<&str>) {
         let field = |name| {
             prepared
@@ -1275,50 +1283,70 @@ impl Router {
         // Reject unsupported gRPC routes before admitting a request or
         // incrementing the selected worker's load.
         if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route != "/v1/chat/completions"
+            && !matches!(route, "/v1/chat/completions" | "/v1/completions")
         {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
             )
                 .into_response();
         }
 
         // All-grpc chat: tokenize once, outside policy and retry.
         // Policy still uses extract_text_for_routing (session / empty).
-        // token_ids stay on PreparedChat for a later token-level policy —
+        // token_ids stay on PreparedRequest for a later token-level policy —
         // do not dump 131k ids into the cache_aware tree.
-        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route == "/v1/chat/completions"
-        {
-            let chat: ChatCompletionRequest =
-                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("gRPC chat convert failed: {e}"),
-                        )
-                            .into_response();
+        //
+        // The concrete request comes from `GenerationRequest::grpc_request`
+        // rather than a `serde_json::Value` roundtrip: the only two routes a
+        // gRPC pool admits are exactly the two concrete request types.
+        let prepared = match (pool, typed_req.grpc_request()) {
+            (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
+                if route == "/v1/chat/completions" =>
+            {
+                match self.frontend.prepare(chat.clone()).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
                     }
-                };
-            match self.frontend.prepare(chat).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    let status =
-                        if e.starts_with("tokenizer:") || e.starts_with("sampling defaults:") {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        } else {
-                            StatusCode::BAD_REQUEST
-                        };
-                    return (status, e).into_response();
                 }
             }
-        } else {
-            None
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => {
+                let lowered = match crate::backend::prepare_grpc_completion(completion) {
+                    Ok(lowered) => lowered,
+                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                };
+                match self
+                    .frontend
+                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
+                    .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
+                    }
+                }
+            }
+            (Some(crate::backend::WorkerPoolKind::Grpc), _) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("gRPC backend received a request body that does not match {route}"),
+                )
+                    .into_response();
+            }
+            _ => None,
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let text = match (pool, typed_req.grpc_request()) {
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
+            _ => typed_req.extract_text_for_routing(),
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1595,13 +1623,13 @@ impl Router {
         } = dispatch;
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
-            // gRPC workers are chat-only in this milestone. Reject unsupported
-            // client routes as request errors so healthy workers are not
-            // penalized by circuit-breaker accounting.
-            if route != "/v1/chat/completions" {
+            // gRPC workers currently support only the chat and completions
+            // endpoints. Treat all other routes as client errors so they do not
+            // count against healthy workers in circuit-breaker accounting.
+            if !matches!(route, "/v1/chat/completions" | "/v1/completions") {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                    format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
                 )
                     .into_response();
             }

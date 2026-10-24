@@ -364,7 +364,7 @@ pub struct FunctionCallDelta {
 
 // ============= Request =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     /// ID of the model to use (optional, vLLM supports requests without model)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -568,6 +568,10 @@ impl GenerationRequest for ChatCompletionRequest {
             .filter(|session_id| !session_id.trim().is_empty())
             .unwrap_or_default()
             .to_string()
+    }
+
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
+        Some(GrpcRequestRef::Chat(self))
     }
 
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -886,11 +890,41 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
+        // Keep generic completion routing prompt-based: this also feeds HTTP
+        // affinity and Program token estimation. gRPC completions apply
+        // session affinity at the typed routing boundary below.
         self.prompt.extract_text_for_routing()
+    }
+
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
+        Some(GrpcRequestRef::Completion(self))
     }
 
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         program_identity_payload(&self.other, self.user.as_deref())
+    }
+}
+
+impl CompletionRequest {
+    /// Routing key for typed gRPC completions. Session affinity is only used
+    /// on this path; token-array prompts without a session have no useful
+    /// prefix key because the generic prompt representation contains only
+    /// their length.
+    pub fn extract_text_for_grpc_routing(&self) -> String {
+        if let Some(session_id) = self
+            .session_params
+            .as_ref()
+            .and_then(|params| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+        {
+            return session_id.to_string();
+        }
+
+        match &self.prompt {
+            PromptInput::IntArray(_) => String::new(),
+            prompt => prompt.extract_text_for_routing(),
+        }
     }
 }
 
@@ -922,6 +956,12 @@ pub struct CompletionChoice {
     /// Hidden states from the model (VLLM extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
+    /// vLLM extension: the client's prompt ids, for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<u32>>,
+    /// vLLM extension: emitted for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ============= Streaming Response =============
@@ -933,6 +973,9 @@ pub struct CompletionStreamResponse {
     pub created: u64,
     pub choices: Vec<CompletionStreamChoice>,
     pub model: String,
+    /// Final usage chunk (`stream_options.include_usage`), vLLM-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
 }
@@ -944,6 +987,9 @@ pub struct CompletionStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
+    /// vLLM extension: emitted for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ==================================================================
@@ -2408,6 +2454,16 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Concretely-typed request behind a [`GenerationRequest`] value.
+///
+/// A gRPC pool only serves `/v1/chat/completions` and `/v1/completions`, so the
+/// prepare path can use the concrete request instead of roundtripping it
+/// through `serde_json::Value`.
+pub enum GrpcRequestRef<'a> {
+    Chat(&'a ChatCompletionRequest),
+    Completion(&'a CompletionRequest),
+}
+
 /// Common trait for all generation requests across different APIs
 pub trait GenerationRequest: Send + Sync {
     /// Check if the request is for streaming
@@ -2426,6 +2482,15 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract only the small body subset used for Program identity parsing.
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Concretely-typed view of this request for the gRPC prepare path.
+    ///
+    /// The gRPC pool serves only `/v1/chat/completions` and `/v1/completions`;
+    /// the generic path uses this to reach the concrete type instead of a
+    /// `serde_json::Value` roundtrip. Types the pool never serves keep `None`.
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
         None
     }
 }
@@ -3982,6 +4047,71 @@ mod tests {
         assert_eq!(
             request.extract_text_for_program_scheduling(),
             "user:first turn\nassistant:previous completion\nuser:next turn"
+        );
+    }
+
+    #[test]
+    fn test_completion_request_routing_stays_prompt_based_with_session_id() {
+        let session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": "completion prompt",
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+        assert_eq!(session.extract_text_for_routing(), "completion prompt");
+        assert_eq!(
+            session.extract_text_for_program_scheduling(),
+            "completion prompt"
+        );
+
+        let grpc_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+        assert_eq!(grpc_session.extract_text_for_routing(), "token_ids:3");
+        assert_eq!(
+            grpc_session.extract_text_for_grpc_routing(),
+            "stable-session"
+        );
+
+        let no_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3]
+        }))
+        .unwrap();
+        assert_eq!(no_session.extract_text_for_routing(), "token_ids:3");
+        assert_eq!(no_session.extract_text_for_grpc_routing(), "");
+    }
+
+    #[test]
+    fn test_completion_grpc_routing_preserves_literal_prompt_and_ignores_blank_session() {
+        let literal: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": "token_ids: explain this field",
+            "session_params": {"session_id": "  "}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            literal.extract_text_for_routing(),
+            "token_ids: explain this field"
+        );
+        assert_eq!(
+            literal.extract_text_for_grpc_routing(),
+            "token_ids: explain this field"
+        );
+
+        let literal_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "session_params": {"session_id": "token_ids:customer-42"}
+        }))
+        .unwrap();
+        assert_eq!(
+            literal_session.extract_text_for_grpc_routing(),
+            "token_ids:customer-42"
         );
     }
 
