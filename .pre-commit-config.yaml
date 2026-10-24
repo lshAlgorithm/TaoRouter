@@ -82,3 +82,12 @@ repos:
         args: [tools/pre_commit/shellcheck.sh]
         language: system
         types: [shell]
+
+      # Same schema check as vllm-omni. Router pipelines have no Omni-only
+      # keys, so the hook validates the YAML directly.
+      - id: check-buildkite
+        name: Validate Buildkite Pipelines
+        entry: python tools/pre_commit/check_buildkite.py
+        language: python
+        files: ^\.buildkite/.*\.ya?ml$
+        additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
