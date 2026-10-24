@@ -676,10 +676,6 @@ def genai_bench_runner() -> Callable[..., None]:
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: mark as end-to-end test")
-    config.addinivalue_line(
-        "markers",
-        "perf: GPU-backed prefix-KV performance (require ROUTER_URL and MODEL)",
-    )
 
 
 @pytest.fixture(scope="session")
