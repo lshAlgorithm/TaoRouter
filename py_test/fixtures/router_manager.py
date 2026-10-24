@@ -1,3 +1,4 @@
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -35,9 +36,11 @@ class RouterManager:
         # Prefer the Rust binary when testing features that live in the host crate
         # (e.g. WASM middleware) without requiring a rebuilt Python wheel.
         router_bin: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
         port = port or find_free_port()
+        router_bin = router_bin or os.environ.get("VLLM_ROUTER_TEST_BIN")
         if router_bin:
             cmd = [
                 router_bin,
@@ -98,6 +101,10 @@ class RouterManager:
                 "cache_threshold": "--cache-threshold",
                 "balance_abs_threshold": "--balance-abs-threshold",
                 "balance_rel_threshold": "--balance-rel-threshold",
+                "router_temperature": "--router-temperature",
+                "kv_penalty_host": "--kv-penalty-host",
+                "kv_penalty_external": "--kv-penalty-external",
+                "kv_penalty_disk": "--kv-penalty-disk",
                 # Retry
                 "retry_max_retries": "--retry-max-retries",
                 "retry_initial_backoff_ms": "--retry-initial-backoff-ms",
@@ -136,7 +143,7 @@ class RouterManager:
                 else:
                     cmd.extend([flag, str(v)])
 
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, env={**os.environ, **(env or {})})
         self._children.append(proc)
         url = f"http://127.0.0.1:{port}"
         self._wait_health(url)
