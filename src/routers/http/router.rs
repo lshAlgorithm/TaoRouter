@@ -1,7 +1,8 @@
 use super::completion_output::CompletionOutputObserver;
 use super::program_adapter::ProgramCompletion;
-use crate::backend::stream_output::{
-    output_frame_tracking, OutputFrameConsumer, OutputFrameProducer,
+use crate::backend::{
+    stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
+    PrepareError,
 };
 use crate::config::types::RetryConfig;
 use crate::core::{
@@ -19,7 +20,8 @@ use crate::program_scheduling::{
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    GrpcRequestRef, InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult,
+    ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -46,6 +48,13 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+fn prepare_error_status(error: &PrepareError) -> StatusCode {
+    match error {
+        PrepareError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PrepareError::Invalid(_) => StatusCode::BAD_REQUEST,
+    }
+}
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
@@ -236,7 +245,7 @@ struct TypedDispatch<'a> {
     is_stream: bool,
     completion: Option<&'a CompletionRoute<'a>>,
     load: RequestLoadGuard,
-    prepared: Option<crate::backend::PreparedChat>,
+    prepared: Option<crate::backend::PreparedRequest>,
 }
 
 struct SelectedWorker {
@@ -1233,7 +1242,7 @@ impl Router {
     }
 
     fn prepared_cache_identity(
-        prepared: Option<&crate::backend::PreparedChat>,
+        prepared: Option<&crate::backend::PreparedRequest>,
     ) -> (Option<&str>, Option<&str>) {
         let field = |name| {
             prepared
@@ -1403,50 +1412,65 @@ impl Router {
         // Reject unsupported gRPC routes before admitting a request or
         // incrementing the selected worker's load.
         if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route != "/v1/chat/completions"
+            && !matches!(route, "/v1/chat/completions" | "/v1/completions")
         {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
             )
                 .into_response();
         }
 
         // All-grpc chat: tokenize once, outside policy and retry.
         // Policy still uses extract_text_for_routing (session / empty).
-        // token_ids stay on PreparedChat for a later token-level policy —
+        // token_ids stay on PreparedRequest for a later token-level policy —
         // do not dump 131k ids into the cache_aware tree.
-        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
-            && route == "/v1/chat/completions"
-        {
-            let chat: ChatCompletionRequest =
-                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("gRPC chat convert failed: {e}"),
-                        )
-                            .into_response();
+        //
+        // The concrete request comes from `GenerationRequest::grpc_request`
+        // rather than a `serde_json::Value` roundtrip: the only two routes a
+        // gRPC pool admits are exactly the two concrete request types.
+        let prepared = match (pool, typed_req.grpc_request()) {
+            (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
+                if route == "/v1/chat/completions" =>
+            {
+                match self.frontend.prepare(chat.clone()).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
                     }
-                };
-            match self.frontend.prepare(chat).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    let status =
-                        if e.starts_with("tokenizer:") || e.starts_with("sampling defaults:") {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        } else {
-                            StatusCode::BAD_REQUEST
-                        };
-                    return (status, e).into_response();
                 }
             }
-        } else {
-            None
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => {
+                let lowered = match crate::backend::prepare_grpc_completion(completion) {
+                    Ok(lowered) => lowered,
+                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                };
+                match self
+                    .frontend
+                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
+                    .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        return (prepare_error_status(&error), error.to_string()).into_response();
+                    }
+                }
+            }
+            (Some(crate::backend::WorkerPoolKind::Grpc), _) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("gRPC backend received a request body that does not match {route}"),
+                )
+                    .into_response();
+            }
+            _ => None,
         };
 
         let completion = match completion
+            .filter(|_| matches!(pool, Some(crate::backend::WorkerPoolKind::Http)))
             .map(|request| self.prepare_completion_route(request, raw_body, model_id))
             .transpose()
         {
@@ -1461,7 +1485,13 @@ impl Router {
                     .as_ref()
                     .and_then(|input| input.tokens.as_deref())
             });
-        let text = typed_req.extract_text_for_routing();
+        let text = match (pool, typed_req.grpc_request()) {
+            (
+                Some(crate::backend::WorkerPoolKind::Grpc),
+                Some(GrpcRequestRef::Completion(completion)),
+            ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
+            _ => typed_req.extract_text_for_routing(),
+        };
         let text = &text;
         let prepared = &prepared;
         let completion = completion.as_ref();
@@ -1750,13 +1780,13 @@ impl Router {
         let raw_body = completion.and_then(|input| input.raw_body);
         let load_incremented = load.tracks_worker();
         if crate::backend::is_grpc_url(worker_url) {
-            // gRPC workers are chat-only in this milestone. Reject unsupported
-            // client routes as request errors so healthy workers are not
-            // penalized by circuit-breaker accounting.
-            if route != "/v1/chat/completions" {
+            // gRPC workers currently support only the chat and completions
+            // endpoints. Treat all other routes as client errors so they do not
+            // count against healthy workers in circuit-breaker accounting.
+            if !matches!(route, "/v1/chat/completions" | "/v1/completions") {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                    format!("gRPC backend currently supports /v1/chat/completions and /v1/completions, not {route}"),
                 )
                     .into_response();
             }
@@ -4059,6 +4089,54 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn grpc_completion_does_not_use_http_input_contract() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("grpc://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        drop(listener);
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+            }));
+        router.retry_config.max_retries = 0;
+        router.pin_test_token_ids(vec![9]);
+        let encodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        router.completion_input = Some(crate::backend::completion_input::CompletionInput {
+            model: "qwen3".into(),
+            cache_model: "qwen3".into(),
+            vocab_size: 0,
+            tokenizer: Arc::new(CompletionCountingTokenizer {
+                inner: vllm_tokenizer::HuggingFaceTokenizer::new_hf(
+                    &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/tokenizer/completion_word_level.json"),
+                )
+                .unwrap(),
+                encodes: encodes.clone(),
+            }),
+        });
+        let raw = bytes::Bytes::from_static(b"{\"model\":\"qwen3\",\"prompt\":[1,2,3]}");
+        let request = serde_json::from_slice(&raw).unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.route_completion_raw(None, &request, &raw, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        drop(response);
+        assert_eq!(encodes.load(Ordering::Relaxed), 0);
+        assert_eq!(worker.load(), 0);
     }
 
     #[tokio::test]
