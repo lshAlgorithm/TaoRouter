@@ -1,6 +1,6 @@
 use crate::routers::RouterTrait;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
@@ -334,7 +334,6 @@ pub async fn start_service_discovery(
                                     &pod_info,
                                     tracked_pods_inner,
                                     router_inner,
-                                    port,
                                     config_inner.pd_mode,
                                 )
                                 .await;
@@ -471,7 +470,7 @@ async fn handle_pod_event(
     } else {
         // Pod is either unhealthy (e.g. Ready=False) or no longer matches selector.
         // If it was previously tracked, remove it from the router and tracking set.
-        remove_tracked_pod(pod_info, tracked_pods, router, port, pd_mode, "ineligible").await;
+        remove_tracked_pod(pod_info, tracked_pods, router, pd_mode, "ineligible").await;
     }
 }
 
@@ -479,17 +478,15 @@ async fn handle_pod_deletion(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
     router: Arc<dyn RouterTrait>,
-    port: u16,
     pd_mode: bool,
 ) {
-    remove_tracked_pod(pod_info, tracked_pods, router, port, pd_mode, "deletion").await;
+    remove_tracked_pod(pod_info, tracked_pods, router, pd_mode, "deletion").await;
 }
 
 async fn remove_tracked_pod(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
     router: Arc<dyn RouterTrait>,
-    port: u16,
     pd_mode: bool,
     reason: &str,
 ) {
@@ -1040,13 +1037,10 @@ mod tests {
             pod_type: None,
             bootstrap_port: None,
         };
-        let port = 8080u16;
-
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&router),
-            port,
             false, // pd_mode = false
         )
         .await;
@@ -1153,7 +1147,6 @@ mod tests {
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&router),
-            port,
             false, // pd_mode = false
         )
         .await;
@@ -1178,15 +1171,12 @@ mod tests {
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
         };
-        let port = 8080u16;
-
         // Don't add pod to tracked set
 
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&router),
-            port,
             true, // pd_mode = true
         )
         .await;
@@ -1294,7 +1284,6 @@ mod tests {
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&router),
-            port,
             true, // pd_mode = true
         )
         .await;
@@ -1896,22 +1885,8 @@ mod tests {
         assert!(tracked_pods.lock().unwrap().is_empty());
 
         // Repeated deletion events on untracked pod must also be clean no-ops
-        handle_pod_deletion(
-            &pod,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false,
-        )
-        .await;
-        handle_pod_deletion(
-            &pod,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false,
-        )
-        .await;
+        handle_pod_deletion(&pod, Arc::clone(&tracked_pods), Arc::clone(&router), false).await;
+        handle_pod_deletion(&pod, Arc::clone(&tracked_pods), Arc::clone(&router), false).await;
         assert!(tracked_pods.lock().unwrap().is_empty());
     }
 
@@ -1985,10 +1960,531 @@ mod tests {
             &healthy_pod,
             Arc::clone(&tracked_pods),
             Arc::clone(&router),
-            port,
             false,
         )
         .await;
         assert!(tracked_pods.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_start_service_discovery_disabled_returns_error() {
+        let router = create_test_router().await;
+        let config = ServiceDiscoveryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let result = start_service_discovery(config, router).await;
+        assert!(result.is_err());
+        match result {
+            Err(kube::Error::Api(err_resp)) => {
+                assert_eq!(err_resp.status, "Disabled");
+                assert_eq!(err_resp.message, "Service discovery is disabled");
+                assert_eq!(err_resp.reason, "ConfigurationError");
+                assert_eq!(err_resp.code, 400);
+            }
+            _ => panic!("Expected kube::Error::Api with ConfigurationError"),
+        }
+    }
+
+    #[test]
+    fn test_should_include_pd_mode_edge_cases() {
+        // Case 1: Both prefill_selector and decode_selector empty in PD mode -> returns false
+        let empty_pd_config = ServiceDiscoveryConfig {
+            enabled: true,
+            pd_mode: true,
+            prefill_selector: HashMap::new(),
+            decode_selector: HashMap::new(),
+            ..Default::default()
+        };
+        let pod = create_pd_k8s_pod("worker-1", "10.0.0.1", "prefill", Some(8081));
+        assert!(!PodInfo::should_include(&pod, &empty_pd_config));
+
+        // Case 2: Only prefill_selector populated
+        let mut prefill_only_config = ServiceDiscoveryConfig {
+            enabled: true,
+            pd_mode: true,
+            decode_selector: HashMap::new(),
+            ..Default::default()
+        };
+        prefill_only_config
+            .prefill_selector
+            .insert("component".to_string(), "prefill".to_string());
+
+        let prefill_pod = create_pd_k8s_pod("p1", "10.0.0.1", "prefill", Some(8081));
+        let decode_pod = create_pd_k8s_pod("d1", "10.0.0.2", "decode", None);
+        assert!(PodInfo::should_include(&prefill_pod, &prefill_only_config));
+        assert!(!PodInfo::should_include(&decode_pod, &prefill_only_config));
+
+        // Case 3: Only decode_selector populated
+        let mut decode_only_config = ServiceDiscoveryConfig {
+            enabled: true,
+            pd_mode: true,
+            prefill_selector: HashMap::new(),
+            ..Default::default()
+        };
+        decode_only_config
+            .decode_selector
+            .insert("component".to_string(), "decode".to_string());
+
+        assert!(!PodInfo::should_include(&prefill_pod, &decode_only_config));
+        assert!(PodInfo::should_include(&decode_pod, &decode_only_config));
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_pd_classification_edge_cases() {
+        let config = create_pd_config();
+
+        // 1. Decode pod with bootstrap port annotation: bootstrap_port MUST be None
+        let mut decode_with_port = create_pd_k8s_pod("d-port", "10.0.0.5", "decode", Some(9999));
+        decode_with_port
+            .metadata
+            .annotations
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert("vllm.ai/bootstrap-port".to_string(), "9999".to_string());
+
+        let info = PodInfo::from_pod(&decode_with_port, Some(&config)).unwrap();
+        assert_eq!(info.pod_type, Some(PodType::Decode));
+        assert_eq!(
+            info.bootstrap_port, None,
+            "Decode pods must never have bootstrap_port populated"
+        );
+
+        // 2. Custom bootstrap_port_annotation
+        let mut custom_config = create_pd_config();
+        custom_config.bootstrap_port_annotation = "custom.ai/port".to_string();
+        let mut prefill_custom = create_pd_k8s_pod("p-custom", "10.0.0.6", "prefill", None);
+        prefill_custom
+            .metadata
+            .annotations
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert("custom.ai/port".to_string(), "7777".to_string());
+
+        let info_custom = PodInfo::from_pod(&prefill_custom, Some(&custom_config)).unwrap();
+        assert_eq!(info_custom.pod_type, Some(PodType::Prefill));
+        assert_eq!(info_custom.bootstrap_port, Some(7777));
+
+        // 3. Pod matching BOTH prefill and decode selectors: Prefill takes precedence
+        let mut ambig_config = ServiceDiscoveryConfig {
+            enabled: true,
+            pd_mode: true,
+            ..Default::default()
+        };
+        ambig_config
+            .prefill_selector
+            .insert("tier".to_string(), "llm".to_string());
+        ambig_config
+            .decode_selector
+            .insert("tier".to_string(), "llm".to_string());
+
+        let mut ambig_pod = create_k8s_pod(
+            Some("ambig-pod"),
+            Some("10.0.0.7"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        let mut ambig_labels = std::collections::BTreeMap::new();
+        ambig_labels.insert("tier".to_string(), "llm".to_string());
+        ambig_pod.metadata.labels = Some(ambig_labels);
+
+        let info_ambig = PodInfo::from_pod(&ambig_pod, Some(&ambig_config)).unwrap();
+        assert_eq!(
+            info_ambig.pod_type,
+            Some(PodType::Prefill),
+            "Prefill selector check is evaluated first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_pod_tracking_and_selective_eviction() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        let p1 = PodInfo {
+            name: "worker-1".into(),
+            namespace: "prod".into(),
+            ip: "10.0.1.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let p2 = PodInfo {
+            name: "worker-2".into(),
+            namespace: "prod".into(),
+            ip: "10.0.1.2".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let p3 = PodInfo {
+            name: "worker-3".into(),
+            namespace: "prod".into(),
+            ip: "10.0.1.3".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        // Pre-track all 3 workers
+        {
+            let mut map = tracked_pods.lock().unwrap();
+            for p in [&p1, &p2, &p3] {
+                map.insert(
+                    p.pod_key(),
+                    TrackedPod {
+                        worker_url: p.worker_url(port),
+                        pod_type: None,
+                    },
+                );
+            }
+        }
+        assert_eq!(tracked_pods.lock().unwrap().len(), 3);
+
+        // Evict worker-2 due to unready probe failure
+        let p2_unready = PodInfo {
+            is_ready: false,
+            ..p2.clone()
+        };
+        handle_pod_event(
+            &p2_unready,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            true,
+        )
+        .await;
+
+        // worker-2 must be evicted; worker-1 and worker-3 must remain intact
+        {
+            let map = tracked_pods.lock().unwrap();
+            assert_eq!(map.len(), 2);
+            assert!(map.contains_key(&p1.pod_key()));
+            assert!(!map.contains_key(&p2.pod_key()));
+            assert!(map.contains_key(&p3.pod_key()));
+        }
+
+        // Evict worker-1 due to selector mismatch (label removed)
+        handle_pod_event(
+            &p1,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            false, // selector mismatch
+        )
+        .await;
+
+        // Only worker-3 remains
+        {
+            let map = tracked_pods.lock().unwrap();
+            assert_eq!(map.len(), 1);
+            assert!(!map.contains_key(&p1.pod_key()));
+            assert!(map.contains_key(&p3.pod_key()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_evicts_failed_or_terminated_phase() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        let pod = PodInfo {
+            name: "failing-pod".into(),
+            namespace: "default".into(),
+            ip: "10.0.2.15".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        // Pre-track the pod
+        tracked_pods.lock().unwrap().insert(
+            pod.pod_key(),
+            TrackedPod {
+                worker_url: pod.worker_url(port),
+                pod_type: None,
+            },
+        );
+        assert!(tracked_pods.lock().unwrap().contains_key(&pod.pod_key()));
+
+        // Event arrives with phase "Failed" (e.g. OOMKilled), even if condition Ready was still True
+        let failed_pod = PodInfo {
+            status: "Failed".into(),
+            is_ready: true,
+            ..pod.clone()
+        };
+        handle_pod_event(
+            &failed_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            true,
+        )
+        .await;
+
+        assert!(
+            !tracked_pods.lock().unwrap().contains_key(&pod.pod_key()),
+            "Failed phase must cause eviction from tracked_pods"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_ipv6_lifecycle() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        let ipv6_pod = PodInfo {
+            name: "ipv6-worker".into(),
+            namespace: "prod".into(),
+            ip: "2001:db8::100".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+        let expected_url = "http://[2001:db8::100]:8000";
+        assert_eq!(ipv6_pod.worker_url(port), expected_url);
+
+        // Pre-track the IPv6 pod
+        tracked_pods.lock().unwrap().insert(
+            ipv6_pod.pod_key(),
+            TrackedPod {
+                worker_url: ipv6_pod.worker_url(port),
+                pod_type: None,
+            },
+        );
+        assert!(tracked_pods
+            .lock()
+            .unwrap()
+            .contains_key(&ipv6_pod.pod_key()));
+
+        // Evict via unready event
+        let unready_ipv6 = PodInfo {
+            is_ready: false,
+            ..ipv6_pod.clone()
+        };
+        handle_pod_event(
+            &unready_ipv6,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            true,
+        )
+        .await;
+
+        assert!(!tracked_pods
+            .lock()
+            .unwrap()
+            .contains_key(&ipv6_pod.pod_key()));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_already_tracked_no_duplicate_add() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        let pod = PodInfo {
+            name: "stable-worker".into(),
+            namespace: "prod".into(),
+            ip: "10.0.4.4".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        // Pre-track the pod
+        let original_url = pod.worker_url(port);
+        tracked_pods.lock().unwrap().insert(
+            pod.pod_key(),
+            TrackedPod {
+                worker_url: original_url.clone(),
+                pod_type: None,
+            },
+        );
+
+        // Receive another healthy event for the already-tracked pod
+        handle_pod_event(
+            &pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            true,
+        )
+        .await;
+
+        // Must still be tracked with original registration entry
+        let map = tracked_pods.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&pod.pod_key()).unwrap().worker_url, original_url);
+    }
+
+    #[tokio::test]
+    async fn test_poisoned_mutex_resilience() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        let pod = PodInfo {
+            name: "test-pod".into(),
+            namespace: "default".into(),
+            ip: "10.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        // Intentionally poison the mutex
+        let tracked_clone = Arc::clone(&tracked_pods);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = tracked_clone.lock().unwrap();
+            panic!("Poisoning mutex");
+        }));
+        assert!(tracked_pods.is_poisoned());
+
+        // Neither handle_pod_event nor handle_pod_deletion should panic
+        handle_pod_event(
+            &pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            false,
+            true,
+        )
+        .await;
+
+        handle_pod_deletion(&pod, Arc::clone(&tracked_pods), Arc::clone(&router), false).await;
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_out_of_range_bootstrap_port() {
+        let mut pod = create_pd_k8s_pod("prefill-pod", "10.0.0.1", "prefill", None);
+        // Add out-of-range bootstrap port annotation (> 65535)
+        pod.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert("vllm.ai/bootstrap-port".to_string(), "70000".to_string());
+        let config = create_pd_config();
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
+        assert!(pod_info.bootstrap_port.is_none());
+
+        // Negative port string
+        pod.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert("vllm.ai/bootstrap-port".to_string(), "-80".to_string());
+        let pod_info_neg = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert!(pod_info_neg.bootstrap_port.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pod_deletion_timestamp_workflow() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        let pod_info = PodInfo {
+            name: "deleting-pod".into(),
+            namespace: "default".into(),
+            ip: "10.0.3.50".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        // Pre-track the pod as running
+        tracked_pods.lock().unwrap().insert(
+            pod_info.pod_key(),
+            TrackedPod {
+                worker_url: pod_info.worker_url(port),
+                pod_type: None,
+            },
+        );
+        assert!(tracked_pods
+            .lock()
+            .unwrap()
+            .contains_key(&pod_info.pod_key()));
+
+        // Simulate k8s deletion event (where deletion_timestamp is set)
+        handle_pod_deletion(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            false,
+        )
+        .await;
+
+        // Pod must be completely evicted from tracked_pods
+        assert!(!tracked_pods
+            .lock()
+            .unwrap()
+            .contains_key(&pod_info.pod_key()));
+        assert!(tracked_pods.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_containers_ready_vs_ready_condition() {
+        let mut pod = create_k8s_pod(
+            Some("multi-cond-pod"),
+            Some("10.0.0.1"),
+            Some("Running"),
+            Some("False"), // Ready is False
+            None,
+        );
+        // Add ContainersReady = True to conditions
+        if let Some(ref mut status) = pod.status {
+            if let Some(ref mut conditions) = status.conditions {
+                conditions.push(PodCondition {
+                    type_: "ContainersReady".to_string(),
+                    status: "True".to_string(),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    message: None,
+                    reason: None,
+                    observed_generation: None,
+                });
+            }
+        }
+        let info = PodInfo::from_pod(&pod, None).unwrap();
+        // ContainersReady=True must not be confused with Ready=True
+        assert!(!info.is_ready);
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_ipv6_parsing() {
+        let pod = create_k8s_pod(
+            Some("ipv6-pod"),
+            Some("2001:db8:85a3::8a2e:370:7334"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        let info = PodInfo::from_pod(&pod, None).unwrap();
+        assert_eq!(
+            info.ip,
+            "2001:db8:85a3::8a2e:370:7334".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            info.worker_url(8080),
+            "http://[2001:db8:85a3::8a2e:370:7334]:8080"
+        );
     }
 }
