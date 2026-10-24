@@ -90,6 +90,10 @@ steps:
   # ============================================================================
   - label: ":satellite: P/D Disaggregation Smoke (4 GPUs)"
     key: "pd-disagg-smoke"
+    # image-build is skipped when ROCM_ONLY=1. A skipped dependency is treated
+    # as satisfied, so this smoke must use the same condition or it will pull
+    # an image that was never pushed.
+    if: build.env("ROCM_ONLY") != "1"
     timeout_in_minutes: 60
     retry:
       automatic:
