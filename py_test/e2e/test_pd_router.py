@@ -8,7 +8,11 @@ from typing import Optional
 import pytest
 import requests
 
-from vllm_test_compat import import_run_eval, vllm_worker_command
+from tools.e2e.vllm_test_compat import (
+    import_run_eval,
+    vllm_worker_command,
+    vllm_worker_popen_env,
+)
 
 run_eval = import_run_eval()
 
@@ -85,7 +89,8 @@ def _popen_launch_prefill_worker(
     cmd = vllm_worker_command(
         model, "127.0.0.1", port, base_gpu_id=base_gpu_id, extra=extra
     )
-    proc = subprocess.Popen(cmd)
+    env = vllm_worker_popen_env(base_gpu_id=base_gpu_id)
+    proc = subprocess.Popen(cmd, env=env)
     _wait_health(url, timeout=300.0)
     return SimpleNamespace(proc=proc, url=url, bootstrap_port=bootstrap_port)
 
@@ -101,7 +106,8 @@ def _popen_launch_decode_worker(
     cmd = vllm_worker_command(
         model, "127.0.0.1", port, base_gpu_id=base_gpu_id, extra=extra
     )
-    proc = subprocess.Popen(cmd)
+    env = vllm_worker_popen_env(base_gpu_id=base_gpu_id)
+    proc = subprocess.Popen(cmd, env=env)
     _wait_health(url, timeout=300.0)
     return SimpleNamespace(proc=proc, url=url)
 

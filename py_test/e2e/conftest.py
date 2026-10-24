@@ -14,11 +14,12 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
-from vllm_test_compat import (
+from tools.e2e.vllm_test_compat import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     e2e_model_name,
     vllm_worker_command,
+    vllm_worker_popen_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,8 @@ def _popen_launch_worker(
         api_key=api_key,
         base_gpu_id=base_gpu_id,
     )
-    return subprocess.Popen(cmd)
+    env = vllm_worker_popen_env(base_gpu_id=base_gpu_id, dp_size=dp_size)
+    return subprocess.Popen(cmd, env=env)
 
 
 def _popen_launch_router_only(
