@@ -286,7 +286,7 @@ class RouterArgs:
             f"--{prefix}max-tree-size",
             type=int,
             default=RouterArgs.max_tree_size,
-            help="Maximum size of the approximation tree for cache-aware routing",
+            help="Per-worker character budget in each model tree (enforced at cache eviction)",
         )
         parser.add_argument(
             f"--{prefix}max-payload-size",

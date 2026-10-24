@@ -155,6 +155,7 @@ pub struct CacheAwareConfig {
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
+    /// Per-worker character budget in each model tree, enforced by periodic eviction.
     pub max_tree_size: usize,
 }
 
