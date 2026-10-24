@@ -99,7 +99,7 @@ def rust_options():
                 raise ValueError(f"Unsupported Rust CLI type for {name}: {field_type}")
         if "num_args = 0.." in attributes:
             value += " [0..]"
-        if "ArgAction::Append" in attributes:
+        if "ArgAction::Append" in attributes or field_type.startswith("Vec<"):
             value += " (repeatable)"
         default_match = re.search(
             r"default_value(?:_t)?\s*=\s*(\"[^\"]*\"|[^,\n]+)", attributes

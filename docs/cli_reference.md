@@ -18,7 +18,7 @@ similar, but they are not interchangeable. In particular:
   selection, tracing, API-key validation URLs, history storage and profiling.
 - Python exposes `--mini-lb`, queue settings and the token bucket refill rate.
   The Rust CLI fixes queue size at `100`, queue timeout at `60` seconds, and
-  leaves the refill rate unset (it falls back to the concurrency limit).
+  leaves the refill rate unset (it falls back to `max_concurrent_requests`).
 - Cache eviction uses `--eviction-interval` in Rust and
   `--eviction-interval-secs` in Python. Log-level choices also differ.
 
@@ -31,10 +31,11 @@ from that CLI. Mode-specific fallbacks are described alongside the tables.
 
 `flag` takes no value; supplying it enables the option. A scalar or choice
 takes one value. `[0..]` takes zero or more space-separated values in one
-occurrence, and `[1..]` requires at least one. Only options marked
-`(repeatable)` accumulate values across occurrences; put other list values
-after one flag. Rust rejects repeated scalar options; Python keeps the last
-value for scalar and non-append list options.
+occurrence, and `[1..]` requires at least one. Options marked `(repeatable)`
+accumulate values across occurrences, including Rust `Vec<T>` options with
+clap's implicit append action. Put non-repeatable list values after one flag.
+Rust rejects repeated scalar options; Python keeps the last value for scalar
+and non-append list options.
 
 Rust integer types are unsigned: `u16` is 0–65535, `u32` is 0–4294967295,
 `u64` is 0–18446744073709551615, and `usize` depends on the target pointer
@@ -51,21 +52,24 @@ width. `f32` and `f64` are floating-point values. Python's `integer` and
 | `--version` | `flag` | `n/a` | — | — | Print the Rust binary version and exit; `-V` is also accepted. |
 | `--max-payload-size` | `usize` | `536870912` | `integer` | `536870912` | Maximum request body size in bytes; the default is 512 MiB. |
 | `--request-timeout-secs` | `u64` | `1800` | `integer` | `1800` | Request timeout in seconds. |
-| `--max-concurrent-requests` | `usize` | `32768` | `integer` | `32768` | Maximum concurrent requests admitted by the router. |
+| `--max-concurrent-requests` | `usize` | `32768` | `integer` | `32768` | Token bucket capacity for request admission; does not enforce a hard limit on in-flight requests. |
 | `--queue-size` | — | — | `integer` | `100` | Pending request queue capacity; `0` disables queuing and returns 429 when full. |
 | `--queue-timeout-secs` | — | — | `integer` | `60` | Maximum time in seconds spent waiting in the request queue. |
 | `--rate-limit-tokens-per-second` | — | — | `integer` | `unset` | Token bucket refill rate for request admission; unset uses `max_concurrent_requests`. These are admission tokens, not generated model tokens. |
-| `--cors-allowed-origins` | `string [0..]` | `[]` | `string [0..]` | `[]` | Allowed browser origins, e.g. `https://example.com`; see CORS behavior below. |
+| `--cors-allowed-origins` | `string [0..] (repeatable)` | `[]` | `string [0..]` | `[]` | Allowed browser origins, e.g. `https://example.com`; see CORS behavior below. |
 
 With no CORS origins, the server permits any origin. Supplying origins restricts
 the allowed list. For Python-only queue and rate-limit controls, use the Python
 launcher; there are no corresponding Rust CLI flags.
 
+Admission tokens refill with elapsed time, so another request can be admitted
+while an earlier request is still running, even with `--max-concurrent-requests 1`.
+
 ## Workers and backend
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--worker-urls` | `string [0..]` | `[]` | `string [0..]` | `[]` | Worker URLs for regular routing, e.g. `http://worker:8000`; Rust also supports `grpc://` inference workers. |
+| `--worker-urls` | `string [0..] (repeatable)` | `[]` | `string [0..]` | `[]` | Worker URLs for regular routing, e.g. `http://worker:8000`; Rust also supports `grpc://` inference workers. |
 | `--worker-startup-timeout-secs` | `u64` | `600` | `integer` | `600` | Time in seconds to wait for workers to become ready. |
 | `--worker-startup-check-interval` | `u64` | `30` | `integer` | `30` | Seconds between worker startup checks. |
 | `--intra-node-data-parallel-size` | `usize` | `1` | `integer` | `1` | DP replicas per worker URL; values greater than 1 enable DP-aware routing. |
@@ -148,11 +152,11 @@ feature; it does not enable it on its own.
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--service-discovery` | `flag` | `false` | `flag` | `false` | Discover workers from Kubernetes pods. |
-| `--selector` | `string [0..]` | `[]` | `string [1..]` | `{}` | Regular worker pod labels as space-separated `key=value` pairs. |
+| `--selector` | `string [0..] (repeatable)` | `[]` | `string [1..]` | `{}` | Regular worker pod labels as space-separated `key=value` pairs. |
 | `--service-discovery-port` | `u16` | `80` | `integer` | `80` | Port used in discovered worker URLs; the parser default is `80` in both CLIs. |
 | `--service-discovery-namespace` | `string` | `unset` | `string` | `unset` | Namespace to watch; unset watches all namespaces and needs cluster-wide permissions. |
-| `--prefill-selector` | `string [0..]` | `[]` | `string [1..]` | `{}` | PD prefill pod labels as space-separated `key=value` pairs. |
-| `--decode-selector` | `string [0..]` | `[]` | `string [1..]` | `{}` | PD decode pod labels as space-separated `key=value` pairs. |
+| `--prefill-selector` | `string [0..] (repeatable)` | `[]` | `string [1..]` | `{}` | PD prefill pod labels as space-separated `key=value` pairs. |
+| `--decode-selector` | `string [0..] (repeatable)` | `[]` | `string [1..]` | `{}` | PD decode pod labels as space-separated `key=value` pairs. |
 
 Selectors are converted to maps. An omitted selector is empty in both CLIs;
 when the same key appears more than once, the last value wins. In PD mode,
@@ -177,7 +181,7 @@ The bootstrap port annotation is fixed to `vllm.ai/bootstrap-port`.
 | `--cb-failure-threshold` | `u32` | `10` | `integer` | `10` | Consecutive failures before opening the circuit breaker. |
 | `--cb-success-threshold` | `u32` | `3` | `integer` | `3` | Successes needed to close the circuit breaker. |
 | `--cb-timeout-duration-secs` | `u64` | `60` | `integer` | `60` | Seconds before an open breaker can transition to half-open. |
-| `--cb-window-duration-secs` | `u64` | `120` | `integer` | `120` | Circuit breaker failure window in seconds. |
+| `--cb-window-duration-secs` | `u64` | `120` | `integer` | `120` | Currently unused by the circuit breaker; changing it has no effect on failure counting. |
 | `--disable-circuit-breaker` | `flag` | `false` | `flag` | `false` | Disable circuit breaking; overrides the circuit breaker configuration. |
 
 ## Health checks
@@ -198,7 +202,7 @@ The bootstrap port annotation is fixed to `vllm.ai/bootstrap-port`.
 | `--log-level` | `debug, info, warn, error` | `info` | `debug, info, warning, error, critical` | `info` | Log severity; Rust accepts `warn`, while Python accepts `warning` and `critical`. |
 | `--prometheus-port` | `u16` | `29000` | `integer` | `29000` | Prometheus listener port. Both CLI parsers enable metrics on `29000` by default. |
 | `--prometheus-host` | `string` | `127.0.0.1` | `string` | `127.0.0.1` | Prometheus listener bind address. |
-| `--request-id-headers` | `string [0..]` | `[]` | `string [0..]` | `unset` | Custom request ID header names; omitted values use common headers, described below. |
+| `--request-id-headers` | `string [0..] (repeatable)` | `[]` | `string [0..]` | `unset` | Custom request ID header names; omitted values use common headers, described below. |
 
 The common request ID headers are `x-request-id`, `x-correlation-id`,
 `x-trace-id` and `request-id`. Rust also uses these when an explicitly supplied
@@ -213,7 +217,7 @@ Prometheus host and port start unset.
 | `--enable-trace` | `flag` | `false` | — | — | Enable OpenTelemetry tracing. |
 | `--otlp-traces-endpoint` | `string` | `unset` | — | — | OTLP collector endpoint (`host:port`); unset respects `OTEL_EXPORTER_OTLP_ENDPOINT`. |
 | `--otel-sampling-ratio` | `f64` | `1.0` | — | — | Parent-based sampling ratio from 0.0 to 1.0; applies when tracing is enabled. |
-| `--otel-excluded-paths` | `string [0..]` | `[]` | — | — | Exact HTTP paths excluded from server spans; omitted or empty uses the default health paths below. |
+| `--otel-excluded-paths` | `string [0..] (repeatable)` | `[]` | — | — | Exact HTTP paths excluded from server spans; omitted or empty uses the default health paths below. |
 
 The default excluded paths are `/health`, `/health_generate`, `/liveness` and
 `/readiness`. A nonempty `--otel-excluded-paths` list replaces them. These
@@ -225,7 +229,7 @@ has tracing support.
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key used for requests to workers. |
-| `--api-key-validation-urls` | `string [0..]` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
+| `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
 ## WASM middleware
 
