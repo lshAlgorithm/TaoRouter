@@ -35,6 +35,21 @@ pub enum PolicyType {
     ConsistentHash,
 }
 
+#[derive(Debug, Clone, PartialEq, FromPyObject)]
+enum DiscoveryPorts {
+    Single(u16),
+    Multiple(Vec<u16>),
+}
+
+impl DiscoveryPorts {
+    fn as_slice(&self) -> &[u16] {
+        match self {
+            Self::Single(port) => std::slice::from_ref(port),
+            Self::Multiple(ports) => ports,
+        }
+    }
+}
+
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
 struct Router {
@@ -65,7 +80,7 @@ struct Router {
     log_level: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
-    service_discovery_port: u16,
+    service_discovery_port: DiscoveryPorts,
     service_discovery_namespace: Option<String>,
     prefill_selector: HashMap<String, String>,
     decode_selector: HashMap<String, String>,
@@ -178,7 +193,8 @@ impl Router {
             Some(DiscoveryConfig {
                 enabled: true,
                 namespace: self.service_discovery_namespace.clone(),
-                port: self.service_discovery_port,
+                port: self.service_discovery_port.as_slice()[0],
+                additional_ports: self.service_discovery_port.as_slice()[1..].to_vec(),
                 check_interval_secs: 60,
                 selector: self.selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
@@ -292,7 +308,7 @@ impl Router {
         log_level = None,
         service_discovery = false,
         selector = HashMap::new(),
-        service_discovery_port = 80,
+        service_discovery_port = DiscoveryPorts::Single(80),
         service_discovery_namespace = None,
         prefill_selector = HashMap::new(),
         decode_selector = HashMap::new(),
@@ -369,7 +385,7 @@ impl Router {
         log_level: Option<String>,
         service_discovery: bool,
         selector: HashMap<String, String>,
-        service_discovery_port: u16,
+        service_discovery_port: DiscoveryPorts,
         service_discovery_namespace: Option<String>,
         prefill_selector: HashMap<String, String>,
         decode_selector: HashMap<String, String>,
@@ -419,6 +435,12 @@ impl Router {
         kv_penalty_external: f64,
         kv_penalty_disk: f64,
     ) -> PyResult<Self> {
+        let discovery_ports = service_discovery_port.as_slice();
+        if discovery_ports.is_empty() || discovery_ports.contains(&0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "service_discovery_port requires at least one port between 1 and 65535",
+            ));
+        }
         if wasm_middleware_sha256
             .as_deref()
             .map(str::trim)
@@ -526,7 +548,8 @@ impl Router {
                 enabled: true,
                 selector: self.selector.clone(),
                 check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
+                port: self.service_discovery_port.as_slice()[0],
+                additional_ports: self.service_discovery_port.as_slice()[1..].to_vec(),
                 namespace: self.service_discovery_namespace.clone(),
                 // HTTP service discovery only supports the vLLM PD router.
                 pd_mode: self.vllm_pd_disaggregation,
