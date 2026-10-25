@@ -37,6 +37,7 @@ struct MooncakePrefillInfo {
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
+    epd: Option<super::epd::EncoderStage>,
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
     /// Service discovery registry for dynamic ZMQ address resolution
@@ -580,14 +581,8 @@ impl VllmPDRouter {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
                 sampling_params["max_tokens"] = json!(1);
-                // Also adjust min_tokens to ensure min_tokens <= max_tokens
-                // This is required because vLLM validates that min_tokens <= max_tokens
-                if let Some(min_tokens) = sampling_params.get("min_tokens").and_then(|v| v.as_u64())
-                {
-                    if min_tokens > 1 {
-                        sampling_params["min_tokens"] = json!(1);
-                    }
-                }
+                // Prevent EOS/stop-token sampling on the only prefill output token.
+                sampling_params["min_tokens"] = json!(1);
             } else {
                 // Create sampling_params with prefill defaults when missing
                 request["sampling_params"] = json!({"max_tokens": 1, "min_tokens": 1});
@@ -601,13 +596,8 @@ impl VllmPDRouter {
             if request.get("max_completion_tokens").is_some() {
                 request["max_completion_tokens"] = json!(1);
             }
-            // Also adjust min_tokens to ensure min_tokens <= max_tokens
-            // This is required because vLLM validates that min_tokens <= max_tokens
-            if let Some(min_tokens) = request.get("min_tokens").and_then(|v| v.as_u64()) {
-                if min_tokens > 1 {
-                    request["min_tokens"] = json!(1);
-                }
-            }
+            // Prevent EOS/stop-token sampling on the only prefill output token.
+            request["min_tokens"] = json!(1);
         }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
@@ -1286,6 +1276,39 @@ impl VllmPDRouter {
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
+        if !original_request.is_object() {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                "Request body must be a JSON object",
+            )
+                .into_response());
+        }
+
+        // The encoder stage must run before the NIXL concurrent fast path:
+        // once a push identity is cached, try_build_concurrent_requests
+        // returns early, and multimodal requests reaching P/D without
+        // published embeddings break encoder-disaggregated workers.
+        let (original_request, mut ec_transfers) = if path == "/v1/chat/completions" {
+            if let Some(epd) = &self.epd {
+                match epd
+                    .prepare(
+                        &self.http_client,
+                        original_request,
+                        prefill_worker.base_url(),
+                        headers,
+                        std::env::var("OPENAI_API_KEY").ok().as_deref(),
+                    )
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(error.into_response()),
+                }
+            } else {
+                (original_request, None)
+            }
+        } else {
+            (original_request, None)
+        };
 
         if let Some((prefill_request, decode_request, request_id)) = self
             .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
@@ -1301,6 +1324,7 @@ impl VllmPDRouter {
                     path,
                     headers,
                     start_time,
+                    ec_transfers,
                 )
                 .await;
         }
@@ -1426,6 +1450,33 @@ impl VllmPDRouter {
             prefill_response.headers()
         );
 
+        if !prefill_response.status().is_success() {
+            prefill_worker.decrement_load();
+            let status = prefill_response.status();
+            let content_type = prefill_response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .cloned();
+            let detail = prefill_response.text().await.unwrap_or_default();
+            self.stop_profiling(&prefill_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            if status.is_client_error() {
+                let mut response = (status, detail).into_response();
+                if let Some(content_type) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(http::header::CONTENT_TYPE, content_type);
+                }
+                return Ok(response);
+            }
+            return Err(PDRouterError::NetworkError {
+                message: format!("Prefill server {prefill_url} returned {status}: {detail}"),
+            });
+        }
+
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1471,6 +1522,33 @@ impl VllmPDRouter {
             }
         };
 
+        if self.epd.is_some()
+            && !matches!(self.kv_connector, KvConnector::Mooncake)
+            && !matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write))
+            && !prefill_response_json
+                .get("kv_transfer_params")
+                .is_some_and(Value::is_object)
+        {
+            prefill_worker.decrement_load();
+            self.stop_profiling(&prefill_base_url).await;
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
+            return Err(PDRouterError::NetworkError {
+                message:
+                    "Prefill returned no KV transfer parameters; refusing metadata-only decode"
+                        .into(),
+            });
+        }
+
+        // Prefill succeeded and consumed the embeddings; the pending EC
+        // transfers are now owned by the decode phase, so disarm the
+        // cancel-on-abandon guard.
+        if let Some(transfers) = ec_transfers.as_mut() {
+            transfers.disarm();
+        }
+
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
@@ -1482,6 +1560,12 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
+        if self.epd.is_some() {
+            // D receives the prompt layout and KV, not P's EC reservations.
+            if let Some(obj) = decode_request.as_object_mut() {
+                obj.remove("ec_transfer_params");
+            }
+        }
         if let Some(params) = self
             .build_decode_kv_transfer_params(
                 &prefill_base_url,
@@ -1704,6 +1788,12 @@ impl VllmPDRouter {
             .ok()?;
 
         let mut decode_request = original_request.clone();
+        if self.epd.is_some() {
+            // D receives the prompt layout and KV, not P's EC reservations.
+            if let Some(obj) = decode_request.as_object_mut() {
+                obj.remove("ec_transfer_params");
+            }
+        }
         decode_request["kv_transfer_params"] =
             Self::build_nixl_push_decode_params(&identity, &request_id);
 
@@ -1721,6 +1811,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         start_time: Instant,
+        mut ec_transfers: Option<super::epd::EcTransferGuard>,
     ) -> Result<Response, PDRouterError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
@@ -1787,6 +1878,18 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                if resp.status().is_client_error() {
+                    let status = resp.status();
+                    let content_type = resp.headers().get(http::header::CONTENT_TYPE).cloned();
+                    let mut response =
+                        (status, resp.bytes().await.unwrap_or_default()).into_response();
+                    if let Some(content_type) = content_type {
+                        response
+                            .headers_mut()
+                            .insert(http::header::CONTENT_TYPE, content_type);
+                    }
+                    return Ok(response);
+                }
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Prefill request failed to {} with status {}",
@@ -1812,6 +1915,12 @@ impl VllmPDRouter {
         };
         if let Some(prefill_json) = prefill_response_json.as_ref() {
             self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
+        }
+        // Prefill succeeded and consumed the embeddings; the pending EC
+        // transfers are now owned by the decode phase, so disarm the
+        // cancel-on-abandon guard.
+        if let Some(transfers) = ec_transfers.as_mut() {
+            transfers.disarm();
         }
 
         let decode_response = match decode_result {
@@ -1876,7 +1985,10 @@ impl VllmPDRouter {
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         let kv_connector = ctx.router_config.kv_connector;
-        let http_client = reqwest::Client::new();
+        // Carries the configured request/connect timeouts; a bare
+        // reqwest::Client::new() would let a stalled encoder hold the
+        // request and its concurrency permit indefinitely.
+        let http_client = ctx.client.clone();
 
         if let Some(ref addr) = discovery_address {
             // Discovery mode
@@ -1903,6 +2015,11 @@ impl VllmPDRouter {
             );
 
             Ok(Self {
+                epd: ctx
+                    .router_config
+                    .epd
+                    .clone()
+                    .map(super::epd::EncoderStage::new),
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,
@@ -1993,6 +2110,11 @@ impl VllmPDRouter {
             }
 
             Ok(Self {
+                epd: ctx
+                    .router_config
+                    .epd
+                    .clone()
+                    .map(super::epd::EncoderStage::new),
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,
@@ -2741,6 +2863,7 @@ mod tests {
         });
         let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
         assert_eq!(result["max_tokens"], 1);
+        assert_eq!(result["min_tokens"], 1);
         assert_eq!(result["stream"], false);
     }
 
@@ -2770,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prefill_chat_completion_leaves_small_min_tokens() {
+    fn test_prefill_chat_completion_raises_zero_min_tokens() {
         let request = json!({
             "model": "test",
             "max_tokens": 512,
@@ -2778,8 +2901,7 @@ mod tests {
         });
         let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
         assert_eq!(result["max_tokens"], 1);
-        // min_tokens <= 1, so it should be left as-is
-        assert_eq!(result["min_tokens"], 0);
+        assert_eq!(result["min_tokens"], 1);
     }
 
     #[test]
@@ -2841,6 +2963,8 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
         // sampling_params.max_tokens should be capped
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        // Inject min_tokens when sampling_params is present but omits it.
+        assert_eq!(result["sampling_params"]["min_tokens"], 1);
         // temperature should be preserved
         assert_eq!(result["sampling_params"]["temperature"], 0.7);
         // top-level max_tokens should NOT be set
