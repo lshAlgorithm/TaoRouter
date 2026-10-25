@@ -278,7 +278,9 @@ mod dp_e2e_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         }
     }
 
@@ -326,7 +328,9 @@ mod dp_e2e_tests {
             history_backend: vllm_router_rs::config::HistoryBackend::Memory,
             enable_profiling: false,
             profile_timeout_secs: 30,
+            epd: None,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+            program_scheduling: None,
         }
     }
 

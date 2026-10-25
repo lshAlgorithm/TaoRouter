@@ -72,6 +72,20 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, info};
 
+/// Backend candidate for a side-effect-free cache-affinity query.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheAwareCandidate<'a> {
+    pub target_id: &'a str,
+    pub kv_pressure: f64,
+}
+
+/// Cache-affinity result committed separately by the caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheAwarePlacement {
+    pub target_id: String,
+    pub match_rate: f32,
+}
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -120,6 +134,60 @@ impl CacheAwarePolicy {
             config,
             trees,
             eviction_handle,
+        }
+    }
+
+    /// Select by the product of text-prefix affinity and current KV headroom.
+    pub fn evaluate_initial_placement(
+        &self,
+        model_id: &str,
+        request_text: &str,
+        candidates: &[CacheAwareCandidate<'_>],
+    ) -> Option<CacheAwarePlacement> {
+        let tree = self.trees.get(normalize_model_key(model_id));
+        let input_chars = request_text.chars().count();
+        candidates
+            .iter()
+            .map(|candidate| {
+                let matched_chars = tree.as_ref().map_or(0, |tree| {
+                    tree.prefix_match_tenant_char_count(request_text, candidate.target_id)
+                });
+                let affinity = if input_chars == 0 {
+                    0.0
+                } else {
+                    matched_chars as f64 / input_chars as f64
+                };
+                let headroom = 1.0 - candidate.kv_pressure.clamp(0.0, 1.0);
+                (candidate, affinity, headroom, (1.0 + affinity) * headroom)
+            })
+            .max_by(|left, right| {
+                left.3
+                    .total_cmp(&right.3)
+                    .then_with(|| left.2.total_cmp(&right.2))
+                    .then_with(|| left.1.total_cmp(&right.1))
+                    .then_with(|| right.0.target_id.cmp(left.0.target_id))
+            })
+            .map(|(candidate, affinity, _, _)| CacheAwarePlacement {
+                target_id: candidate.target_id.to_string(),
+                match_rate: affinity as f32,
+            })
+    }
+
+    /// Update the affinity tree after the selected target is committed.
+    pub fn commit_placement(&self, model_id: &str, request_text: &str, target_id: &str) {
+        if request_text.is_empty() {
+            return;
+        }
+        self.trees
+            .entry(normalize_model_key(model_id).to_string())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .insert(request_text, target_id);
+    }
+
+    /// Remove one unavailable target from a model's affinity tree.
+    pub fn remove_placement_target(&self, model_id: &str, target_id: &str) {
+        if let Some(tree) = self.trees.get(normalize_model_key(model_id)) {
+            tree.remove_tenant(target_id);
         }
     }
 
@@ -242,11 +310,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
+        // Base the load decision on workers that are eligible for selection.
+        // Unhealthy workers must not affect whether healthy workers use cache
+        // affinity or load balancing.
+        let (min_load, max_load) = healthy_indices
+            .iter()
+            .map(|&idx| workers[idx].load())
+            .fold((usize::MAX, 0usize), |(min, max), load| {
+                (min.min(load), max.max(load))
+            });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
@@ -480,6 +552,40 @@ mod tests {
     use crate::core::{BasicWorker, WorkerType};
 
     #[test]
+    fn unhealthy_worker_load_does_not_disable_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 100,
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| {
+                Arc::new(BasicWorker::new(
+                    format!("http://worker-{index}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        workers[0].set_healthy(false);
+        workers[2].set_healthy(false);
+        policy.init_workers(&workers);
+        for _ in 0..5 {
+            workers[0].increment_load();
+            workers[1].increment_load();
+        }
+
+        // Establish affinity while worker 1 is the only healthy worker.
+        assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+        workers[0].set_healthy(true);
+
+        // Both eligible workers have equal load, so the unhealthy zero-load
+        // worker must not switch the policy into load-balancing mode.
+        assert_eq!(policy.select_worker(&workers, Some("sticky")), Some(1));
+    }
+
+    #[test]
     fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
         let config = CacheAwareConfig {
@@ -511,6 +617,34 @@ mod tests {
         // Similar request should also go to same worker
         let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn literal_token_ids_prefix_keeps_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+        let key = "token_ids: explain this field";
+        let model_id = normalize_model_key(workers[0].model_id());
+        policy
+            .trees
+            .get(model_id)
+            .expect("initialized model cache")
+            .insert(key, workers[1].url());
+
+        assert_eq!(policy.select_worker(&workers, Some(key)), Some(1));
     }
 
     #[test]
@@ -573,5 +707,48 @@ mod tests {
         // All requests should now go to worker2
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn initial_placement_combines_affinity_and_headroom_without_mutation() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let candidates = [
+            CacheAwareCandidate {
+                target_id: "rank-0",
+                kv_pressure: 0.2,
+            },
+            CacheAwareCandidate {
+                target_id: "rank-1",
+                kv_pressure: 0.1,
+            },
+        ];
+        assert_eq!(
+            policy
+                .evaluate_initial_placement("model", "shared suffix", &candidates)
+                .unwrap()
+                .target_id,
+            "rank-1"
+        );
+        policy.commit_placement("model", "shared first", "rank-0");
+        let equal_pressure = [
+            CacheAwareCandidate {
+                target_id: "rank-0",
+                kv_pressure: 0.1,
+            },
+            CacheAwareCandidate {
+                target_id: "rank-1",
+                kv_pressure: 0.1,
+            },
+        ];
+        assert_eq!(
+            policy
+                .evaluate_initial_placement("model", "shared second", &equal_pressure)
+                .unwrap()
+                .target_id,
+            "rank-0"
+        );
     }
 }

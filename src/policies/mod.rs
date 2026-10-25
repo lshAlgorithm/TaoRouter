@@ -11,17 +11,24 @@ use std::sync::Arc;
 mod cache_aware;
 mod consistent_hash;
 mod factory;
-mod hash_key;
+pub(crate) mod hash_key;
+mod kv_aware;
 mod power_of_two;
 mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
 
-pub use cache_aware::CacheAwarePolicy;
+pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy};
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+pub use kv_aware::{
+    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
+    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
+    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
+    TemperaturePicker, TieredMatchProvider, TransferCredits,
+};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

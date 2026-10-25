@@ -64,7 +64,7 @@ use std::collections::HashMap;
 pub enum ChatMessage {
     System {
         role: String,
-        content: String,
+        content: UserMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -77,7 +77,7 @@ pub enum ChatMessage {
     Assistant {
         role: String, // "assistant"
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<UserMessageContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +99,9 @@ pub enum ChatMessage {
         content: String,
         name: String,
     },
+    /// Unknown or model-specific message roles are preserved verbatim so the
+    /// downstream inference backend can validate and interpret them.
+    Other(Value),
 }
 
 impl<'de> Deserialize<'de> for ChatMessage {
@@ -111,18 +114,17 @@ impl<'de> Deserialize<'de> for ChatMessage {
         let value = Value::deserialize(deserializer)?;
         let role = value
             .get("role")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| D::Error::custom("missing role field"))?;
+            .ok_or_else(|| D::Error::custom("missing role field"))?
+            .as_str()
+            .ok_or_else(|| D::Error::custom("role field must be a string"))?;
 
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
-                content: value.get("content").and_then(|c| {
-                    if c.is_null() {
-                        None
-                    } else {
-                        c.as_str().map(String::from)
-                    }
+                content: value.get("content").and_then(|content| {
+                    (!content.is_null())
+                        .then(|| serde_json::from_value(content.clone()).ok())
+                        .flatten()
                 }),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
@@ -159,9 +161,8 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 role: role.to_string(),
                 content: value
                     .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                    .and_then(|content| serde_json::from_value(content.clone()).ok())
+                    .unwrap_or(UserMessageContent::Text(String::new())),
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -215,7 +216,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                     .unwrap_or("")
                     .to_string(),
             }),
-            _ => Err(D::Error::custom(format!("unknown role: {}", role))),
+            _ => Ok(ChatMessage::Other(value)),
         }
     }
 }
@@ -268,6 +269,23 @@ pub struct StructuredOutputsParams {
 pub enum UserMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+impl UserMessageContent {
+    /// Return non-empty textual parts in wire order for prefix-aware routing.
+    fn routing_texts(&self) -> Vec<&str> {
+        match self {
+            Self::Text(text) if !text.trim().is_empty() => vec![text.as_str()],
+            Self::Text(_) => Vec::new(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -351,7 +369,7 @@ pub struct FunctionCallDelta {
 
 // ============= Request =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     /// ID of the model to use (optional, vLLM supports requests without model)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -482,8 +500,8 @@ pub struct ChatCompletionRequest {
     pub ignore_eos: bool,
 
     /// Add generation prompt to the chat template
-    #[serde(default = "default_true")]
-    pub add_generation_prompt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_generation_prompt: Option<bool>,
 
     /// Continue generating from final assistant message
     #[serde(default)]
@@ -522,7 +540,7 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
 
-    /// Reasoning effort level for reasoning models (low, medium, high)
+    /// Reasoning effort level for reasoning models
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -548,19 +566,126 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Use session_id from session_params for session-based routing
-        if let Some(ref session_params) = self.session_params {
-            if let Some(session_id) = session_params.get("session_id") {
-                if let Some(session_id_str) = session_id.as_str() {
-                    if !session_id_str.trim().is_empty() {
-                        return session_id_str.to_string();
+        self.session_params
+            .as_ref()
+            .and_then(|params| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
+        Some(GrpcRequestRef::Chat(self))
+    }
+
+    fn extract_text_for_program_scheduling(&self) -> String {
+        let mut parts = Vec::new();
+        for message in &self.messages {
+            match message {
+                ChatMessage::System { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("system:{}", text.trim()));
                     }
                 }
+                ChatMessage::User { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("user:{}", text.trim()));
+                    }
+                }
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    function_call,
+                    ..
+                } => {
+                    if let Some(content) = content {
+                        for text in content.routing_texts() {
+                            parts.push(format!("assistant:{}", text.trim()));
+                        }
+                    }
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            if let Some(arguments) = &call.function.arguments {
+                                if !arguments.trim().is_empty() {
+                                    parts.push(format!(
+                                        "assistant_tool_call:{}:{}",
+                                        call.function.name.trim(),
+                                        arguments.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(call) = function_call {
+                        if let Some(arguments) = &call.arguments {
+                            if !arguments.trim().is_empty() {
+                                parts.push(format!(
+                                    "assistant_function_call:{}:{}",
+                                    call.name.trim(),
+                                    arguments.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Tool { content, .. } => {
+                    if let Some(text) = content.as_str() {
+                        if !text.trim().is_empty() {
+                            parts.push(format!("tool:{}", text.trim()));
+                        }
+                    } else if let Some(items) = content.as_array() {
+                        for item in items {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                if !text.trim().is_empty() {
+                                    parts.push(format!("tool:{}", text.trim()));
+                                }
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Function { content, name, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("function:{}:{}", name.trim(), content.trim()));
+                }
+                _ => {}
             }
         }
+        if let Some(tools) = &self.tools {
+            let mut tools = tools.iter().collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+            for tool in tools {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "tool_schema:{}:{}:{}",
+                    tool.function.name.trim(),
+                    tool.function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        if let Some(functions) = &self.functions {
+            let mut functions = functions.iter().collect::<Vec<_>>();
+            functions.sort_by(|left, right| left.name.cmp(&right.name));
+            for function in functions {
+                let parameters = serde_json::to_string(&function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "function_schema:{}:{}:{}",
+                    function.name.trim(),
+                    function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+        self.extract_text_for_routing()
+    }
 
-        // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, self.user.as_deref())
     }
 }
 
@@ -770,7 +895,41 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
+        // Keep generic completion routing prompt-based: this also feeds HTTP
+        // affinity and Program token estimation. gRPC completions apply
+        // session affinity at the typed routing boundary below.
         self.prompt.extract_text_for_routing()
+    }
+
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
+        Some(GrpcRequestRef::Completion(self))
+    }
+
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, self.user.as_deref())
+    }
+}
+
+impl CompletionRequest {
+    /// Routing key for typed gRPC completions. Session affinity is only used
+    /// on this path; token-array prompts without a session have no useful
+    /// prefix key because the generic prompt representation contains only
+    /// their length.
+    pub fn extract_text_for_grpc_routing(&self) -> String {
+        if let Some(session_id) = self
+            .session_params
+            .as_ref()
+            .and_then(|params| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+        {
+            return session_id.to_string();
+        }
+
+        match &self.prompt {
+            PromptInput::IntArray(_) => String::new(),
+            prompt => prompt.extract_text_for_routing(),
+        }
     }
 }
 
@@ -802,6 +961,12 @@ pub struct CompletionChoice {
     /// Hidden states from the model (VLLM extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
+    /// vLLM extension: the client's prompt ids, for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<u32>>,
+    /// vLLM extension: emitted for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ============= Streaming Response =============
@@ -813,6 +978,9 @@ pub struct CompletionStreamResponse {
     pub created: u64,
     pub choices: Vec<CompletionStreamChoice>,
     pub model: String,
+    /// Final usage chunk (`stream_options.include_usage`), vLLM-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
 }
@@ -824,6 +992,9 @@ pub struct CompletionStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
+    /// vLLM extension: emitted for `return_token_ids` requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ==================================================================
@@ -857,12 +1028,16 @@ fn default_reasoning_effort() -> Option<ReasoningEffort> {
     Some(ReasoningEffort::Medium)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
+    Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
 }
 
 // ============= Input/Output Items =============
@@ -2012,6 +2187,10 @@ impl GenerationRequest for InferenceGenerateRequest {
             .collect::<Vec<String>>()
             .join(" ")
     }
+
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        program_identity_payload(&self.other, None)
+    }
 }
 
 // ==================================================================
@@ -2280,6 +2459,16 @@ pub fn default_true() -> bool {
     true
 }
 
+/// Concretely-typed request behind a [`GenerationRequest`] value.
+///
+/// A gRPC pool only serves `/v1/chat/completions` and `/v1/completions`, so the
+/// prepare path can use the concrete request instead of roundtripping it
+/// through `serde_json::Value`.
+pub enum GrpcRequestRef<'a> {
+    Chat(&'a ChatCompletionRequest),
+    Completion(&'a CompletionRequest),
+}
+
 /// Common trait for all generation requests across different APIs
 pub trait GenerationRequest: Send + Sync {
     /// Check if the request is for streaming
@@ -2290,6 +2479,50 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Extract prompt content used only by opted-in Program scheduling.
+    fn extract_text_for_program_scheduling(&self) -> String {
+        self.extract_text_for_routing()
+    }
+
+    /// Extract only the small body subset used for Program identity parsing.
+    fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Concretely-typed view of this request for the gRPC prepare path.
+    ///
+    /// The gRPC pool serves only `/v1/chat/completions` and `/v1/completions`;
+    /// the generic path uses this to reach the concrete type instead of a
+    /// `serde_json::Value` roundtrip. Types the pool never serves keep `None`.
+    fn grpc_request(&self) -> Option<GrpcRequestRef<'_>> {
+        None
+    }
+}
+
+fn program_identity_payload(
+    other: &serde_json::Map<String, serde_json::Value>,
+    user: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut payload = serde_json::Map::new();
+    for field in [
+        "vllm_xargs",
+        "agent_hint",
+        "session_params",
+        "session_id",
+        "user_id",
+    ] {
+        if let Some(value) = other.get(field) {
+            payload.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(user) = user {
+        payload.insert(
+            "user".to_string(),
+            serde_json::Value::String(user.to_string()),
+        );
+    }
+    (!payload.is_empty()).then_some(serde_json::Value::Object(payload))
 }
 
 /// Helper type for string or array of strings
@@ -2330,15 +2563,20 @@ impl StringOrArray {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum PromptInput {
+    /// Single string: str
+    ///
+    /// Kept first because a JSON string can only match this variant. With
+    /// `untagged`, serde tries variants in order and formats the whole prompt
+    /// into a discarded error for every failed sequence attempt, which dominated
+    /// parsing latency for long prompts (#310).
+    String(String),
     /// Batch of token ID sequences: list[list[int]]
-    /// This must come first due to serde untagged matching order
+    /// Must come before the other sequence variants due to serde untagged matching order
     IntBatch(Vec<Vec<i32>>),
     /// Array of strings: list[str]
     StringArray(Vec<String>),
     /// Single token ID sequence: list[int]
     IntArray(Vec<i32>),
-    /// Single string: str
-    String(String),
 }
 
 impl PromptInput {
@@ -2414,6 +2652,24 @@ pub enum LoRAPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_identity_payload_excludes_generation_content() {
+        let other = serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+            "vllm_xargs": {"agentic_context": {"program_id": "program-a"}},
+            "agent_hint": {"session_id": "session-a"},
+            "prompt": "must-not-be-copied",
+            "messages": ["must-not-be-copied"]
+        }))
+        .unwrap();
+        let payload = program_identity_payload(&other, Some("user-a")).unwrap();
+        assert_eq!(payload.as_object().unwrap().len(), 3);
+        assert!(payload.get("vllm_xargs").is_some());
+        assert!(payload.get("agent_hint").is_some());
+        assert_eq!(payload.get("user").unwrap(), "user-a");
+        assert!(payload.get("prompt").is_none());
+        assert!(payload.get("messages").is_none());
+    }
     use serde_json;
 
     // ==================================================================
@@ -3411,6 +3667,48 @@ mod tests {
         assert!(params.whitespace_pattern.is_none());
     }
 
+    /// Regression test for #186: `response_format.json_schema.schema` must be forwarded to
+    /// the worker with its properties in the same order the client sent them.
+    ///
+    /// `schema` is a `serde_json::Value`, whose `Object` variant sorts keys alphabetically
+    /// unless the `preserve_order` crate feature is enabled (Cargo.toml). Some backends use the
+    /// property order in the schema to decide the generation order for structured output, so
+    /// reordering it here silently changes what the model is asked to produce.
+    #[test]
+    fn test_response_format_json_schema_preserves_property_order() {
+        let input = r#"{"type":"json_schema","json_schema":{"name":"x","schema":{"zebra":1,"apple":2,"mango":3}}}"#;
+
+        let rf: ResponseFormat = serde_json::from_str(input).unwrap();
+        let ResponseFormat::JsonSchema { json_schema } = &rf else {
+            panic!("expected JsonSchema variant");
+        };
+        let schema_keys: Vec<&String> = json_schema.schema.as_object().unwrap().keys().collect();
+        assert_eq!(schema_keys, vec!["zebra", "apple", "mango"]);
+
+        // The round-tripped JSON sent to the worker must preserve the same order.
+        assert_eq!(serde_json::to_string(&rf).unwrap(), input);
+    }
+
+    /// Regression test for #186: a tool's `function.parameters` JSON Schema must also keep the
+    /// client's property order when forwarded to the worker (same root cause as the
+    /// `response_format.json_schema` case above).
+    #[test]
+    fn test_tool_function_parameters_preserves_property_order() {
+        let input = r#"{"type":"function","function":{"name":"f","parameters":{"zebra":1,"apple":2,"mango":3}}}"#;
+
+        let tool: Tool = serde_json::from_str(input).unwrap();
+        let param_keys: Vec<&String> = tool
+            .function
+            .parameters
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(param_keys, vec!["zebra", "apple", "mango"]);
+
+        assert_eq!(serde_json::to_string(&tool).unwrap(), input);
+    }
+
     #[test]
     fn test_structured_outputs_params_with_json_schema() {
         let schema = serde_json::json!({
@@ -3642,7 +3940,10 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello there!");
+                assert!(matches!(
+                    content.as_ref(),
+                    Some(UserMessageContent::Text(text)) if text == "Hello there!"
+                ));
                 assert_eq!(
                     reasoning.as_ref().unwrap(),
                     "Let me think about how to greet the user..."
@@ -3714,11 +4015,170 @@ mod tests {
         let message: ChatMessage = serde_json::from_str(json).unwrap();
 
         match message {
-            ChatMessage::System { content, .. } => {
-                assert_eq!(content, "You are a helpful assistant.");
-            }
+            ChatMessage::System {
+                content: UserMessageContent::Text(content),
+                ..
+            } => assert_eq!(content, "You are a helpful assistant."),
             _ => panic!("Expected System message"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_system_content_blocks_round_trip() {
+        let json = serde_json::json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "shared prefix"},
+                {"type": "text", "text": "session prefix"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_request_program_text_includes_system_content_blocks() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "shared prefix"},
+                        {"type": "text", "text": "session prefix"}
+                    ]
+                },
+                {"role": "user", "content": "next turn"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "system:shared prefix\nsystem:session prefix\nuser:next turn"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_keeps_session_id_for_native_routing() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {"role": "assistant", "content": "previous completion"},
+                {"role": "user", "content": "next turn"}
+            ],
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+
+        assert_eq!(request.extract_text_for_routing(), "stable-session");
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:first turn\nassistant:previous completion\nuser:next turn"
+        );
+    }
+
+    #[test]
+    fn test_completion_request_routing_stays_prompt_based_with_session_id() {
+        let session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": "completion prompt",
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+        assert_eq!(session.extract_text_for_routing(), "completion prompt");
+        assert_eq!(
+            session.extract_text_for_program_scheduling(),
+            "completion prompt"
+        );
+
+        let grpc_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+        assert_eq!(grpc_session.extract_text_for_routing(), "token_ids:3");
+        assert_eq!(
+            grpc_session.extract_text_for_grpc_routing(),
+            "stable-session"
+        );
+
+        let no_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3]
+        }))
+        .unwrap();
+        assert_eq!(no_session.extract_text_for_routing(), "token_ids:3");
+        assert_eq!(no_session.extract_text_for_grpc_routing(), "");
+    }
+
+    #[test]
+    fn test_completion_grpc_routing_preserves_literal_prompt_and_ignores_blank_session() {
+        let literal: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": "token_ids: explain this field",
+            "session_params": {"session_id": "  "}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            literal.extract_text_for_routing(),
+            "token_ids: explain this field"
+        );
+        assert_eq!(
+            literal.extract_text_for_grpc_routing(),
+            "token_ids: explain this field"
+        );
+
+        let literal_session: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "session_params": {"session_id": "token_ids:customer-42"}
+        }))
+        .unwrap();
+        assert_eq!(
+            literal_session.extract_text_for_grpc_routing(),
+            "token_ids:customer-42"
+        );
+    }
+
+    #[test]
+    fn test_chat_message_assistant_content_blocks_round_trip() {
+        let json = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "previous completion"}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_request_program_text_includes_assistant_content_blocks() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "previous completion"}]
+                },
+                {"role": "user", "content": "next turn"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.extract_text_for_program_scheduling(),
+            "user:first turn\nassistant:previous completion\nuser:next turn"
+        );
     }
 
     #[test]
@@ -3808,10 +4268,86 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_message_latest_reminder_roundtrip() {
+        let original = serde_json::json!({
+            "role": "latest_reminder",
+            "content": "Follow the latest instructions.",
+            "model_specific_field": {
+                "priority": 1,
+                "enabled": true
+            }
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        match &message {
+            ChatMessage::Other(value) => assert_eq!(value, &original),
+            _ => panic!("Expected unknown role to use the Other variant"),
+        }
+
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_message_arbitrary_role_roundtrip() {
+        let original = serde_json::json!({
+            "role": "developer",
+            "content": [
+                {"type": "text", "text": "Model-specific instructions"}
+            ],
+            "future_field": [1, 2, 3]
+        });
+
+        let message: ChatMessage = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(message, ChatMessage::Other(_)));
+        assert_eq!(serde_json::to_value(message).unwrap(), original);
+    }
+
+    #[test]
+    fn test_chat_completion_request_preserves_unknown_role_message() {
+        let original = serde_json::json!({
+            "model": "deepseek-model",
+            "messages": [{
+                "role": "latest_reminder",
+                "content": "Remember the latest user request.",
+                "metadata": {"source": "deepseek"}
+            }],
+            "temperature": 0.25,
+            "max_tokens": 128,
+            "stream": true,
+            "model_specific_request_field": {
+                "priority": 1,
+                "enabled": true
+            }
+        });
+
+        let request: ChatCompletionRequest = serde_json::from_value(original.clone()).unwrap();
+        assert!(matches!(&request.messages[0], ChatMessage::Other(_)));
+
+        let serialized = serde_json::to_value(request).unwrap();
+        for (key, expected) in original.as_object().unwrap() {
+            assert_eq!(
+                &serialized[key], expected,
+                "request field `{key}` must survive the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chat_message_rejects_missing_or_non_string_role() {
+        let missing_role = serde_json::json!({"content": "missing role"});
+        let error = serde_json::from_value::<ChatMessage>(missing_role).unwrap_err();
+        assert!(error.to_string().contains("missing role field"));
+
+        let non_string_role = serde_json::json!({"role": 42, "content": "invalid role"});
+        let error = serde_json::from_value::<ChatMessage>(non_string_role).unwrap_err();
+        assert!(error.to_string().contains("role field must be a string"));
+    }
+
+    #[test]
     fn test_chat_message_roundtrip_serialization() {
         let original = ChatMessage::Assistant {
             role: "assistant".to_string(),
-            content: Some("Hello!".to_string()),
+            content: Some(UserMessageContent::Text("Hello!".to_string())),
             name: None,
             tool_calls: None,
             function_call: None,
@@ -3825,7 +4361,10 @@ mod tests {
             ChatMessage::Assistant {
                 content, reasoning, ..
             } => {
-                assert_eq!(content.as_ref().unwrap(), "Hello!");
+                assert!(matches!(
+                    content.as_ref(),
+                    Some(UserMessageContent::Text(text)) if text == "Hello!"
+                ));
                 assert_eq!(reasoning.as_ref().unwrap(), "Thinking...");
             }
             _ => panic!("Expected Assistant message"),
