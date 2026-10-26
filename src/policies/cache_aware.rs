@@ -546,7 +546,7 @@ impl Drop for CacheAwarePolicy {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
@@ -617,6 +617,34 @@ mod tests {
         // Similar request should also go to same worker
         let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn literal_token_ids_prefix_keeps_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+        policy.init_workers(&workers);
+        let key = "token_ids: explain this field";
+        let model_id = normalize_model_key(workers[0].model_id());
+        policy
+            .trees
+            .get(model_id)
+            .expect("initialized model cache")
+            .insert(key, workers[1].url());
+
+        assert_eq!(policy.select_worker(&workers, Some(key)), Some(1));
     }
 
     #[test]

@@ -152,7 +152,7 @@ fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<Tokenize
     Ok(Some(config))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -170,7 +170,7 @@ mod tests {
             Arc::new(Self {
                 inner: HuggingFaceTokenizer::new_hf(std::path::Path::new(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/tokenizer/byte_level_bpe.json"
+                    "/tests/rust/fixtures/tokenizer/byte_level_bpe.json"
                 )))
                 .unwrap(),
                 calls: AtomicUsize::new(0),
