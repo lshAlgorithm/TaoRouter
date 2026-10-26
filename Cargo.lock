@@ -7408,7 +7408,7 @@ dependencies = [
 
 [[package]]
 name = "vllm_router_rs"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -7430,6 +7430,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "lazy_static",
+ "libc",
  "lru",
  "metrics",
  "metrics-exporter-prometheus",
@@ -7446,6 +7447,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "rmp-serde",
+ "rmpv",
  "rustls",
  "serde",
  "serde_json",

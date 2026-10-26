@@ -1,10 +1,5 @@
-//! Chat+tokenize for gRPC workers: **only** `vllm-chat` + `vllm-tokenizer`.
-//!
-//! There is no HuggingFace/minijinja fallback. If those crates are not
-//! linked, `grpc://` is unavailable.
-//!
-//! `TokenizerCache` caches loaded frontend objects (`load_model_backends`),
-//! not prior-request token ids or engine KV.
+//! gRPC chat rendering and tokenization via `vllm-chat` and `vllm-tokenizer`.
+//! Loaded models share an optional L0 encoding cache.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +8,9 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use parking_lot::RwLock;
+
+use super::encode_cache::FrontendCache;
+use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
 
 use super::vllm_frontend::{
     chat_request_from_openai, system_text, tool_text, user_text, OpenAiChatRequest, VllmFrontend,
@@ -33,16 +31,13 @@ enum Frontend {
     TestIds(Vec<u32>),
 }
 
-/// In-process cache of loaded `vllm-chat` / `vllm-tokenizer` objects.
-///
-/// First request for a model key calls `load_model_backends`; later
-/// requests clone the `Arc`. This is **not** reuse of prior-request
-/// `token_ids` and **not** engine KV / prefix-cache routing.
+/// Loads each model once and optionally shares an L0 budget across models.
 #[derive(Clone)]
 pub struct TokenizerCache {
     pinned: Arc<RwLock<Option<Frontend>>>,
     by_model: Arc<DashMap<String, Arc<VllmFrontend>>>,
     load_lock: Arc<tokio::sync::Mutex<()>>,
+    encoding_cache: Option<Arc<FrontendCache>>,
 }
 
 impl std::fmt::Debug for TokenizerCache {
@@ -63,7 +58,21 @@ impl TokenizerCache {
             pinned: Arc::new(RwLock::new(None)),
             by_model: Arc::new(DashMap::new()),
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
+            encoding_cache: None,
         }
+    }
+
+    /// Enable L0 with a shared budget across models.
+    pub fn with_encoding_cache(config: TokenizerCacheConfig) -> Result<Self> {
+        Ok(Self {
+            encoding_cache: Some(Arc::new(FrontendCache::new(config)?)),
+            ..Self::new()
+        })
+    }
+
+    /// L0 stats across models, or None when disabled.
+    pub fn encoding_cache_stats(&self) -> Option<TokenizerCacheStats> {
+        self.encoding_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Tests only: bypass model loading by returning these fake prompt ids.
@@ -86,7 +95,7 @@ impl TokenizerCache {
             return Ok(FrontendHandle(Frontend::Vllm(hit.clone())));
         }
         let frontend = Arc::new(
-            VllmFrontend::load(&source, Default::default())
+            VllmFrontend::load(&source, Default::default(), self.encoding_cache.clone())
                 .await
                 .map_err(|e| anyhow!("vllm-chat load {source} for key {key}: {e}"))?,
         );
@@ -282,7 +291,7 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
         return Err(anyhow!("vllm-chat produced empty token_ids"));
     }
     Ok(TokenizeOut {
-        token_ids: Arc::from(token_ids),
+        token_ids,
         adapt_ms,
         template_ms,
         encode_ms,
@@ -356,6 +365,17 @@ fn spec_messages_to_upstream(
                         "legacy function messages are not supported by vllm-chat"
                     ));
                 }
+                SpecChatMessage::Other(value) => {
+                    // HTTP backends can forward unknown roles verbatim, but vllm-chat
+                    // cannot represent them, so the gRPC frontend rejects them.
+                    let role = value
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("ChatMessage::Other must contain a string `role`");
+                    return Err(anyhow!(
+                        "chat message role `{role}` is not supported by the router gRPC frontend"
+                    ));
+                }
             })
         })
         .collect()
@@ -421,11 +441,18 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
         UserMessageContent::Parts(parts) => {
             let mut text = String::new();
             for part in parts {
-                match part {
-                    crate::protocols::spec::ContentPart::Text { text: part } => {
-                        text.push_str(part);
+                match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        let part_text = part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow!("text content part is missing a string `text` field")
+                            })?;
+                        text.push_str(part_text);
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    // The token_ids-only gRPC path cannot carry non-text parts.
+                    _ => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));
@@ -504,7 +531,7 @@ mod tests {
     }
 
     async fn rust_vllm_chat_ids(model: &str, messages: serde_json::Value) -> Vec<u32> {
-        let frontend = VllmFrontend::load(model, Default::default())
+        let frontend = VllmFrontend::load(model, Default::default(), None)
             .await
             .expect("vllm-chat load_model_backends");
         let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -558,6 +585,25 @@ mod tests {
                     && call.name == "weather"
                     && call.arguments == "{\"city\":\"Paris\"}"
         ));
+    }
+
+    #[test]
+    fn rejects_unknown_roles_on_grpc_path() {
+        for role in ["latest_reminder", "developer"] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "messages": [{
+                    "role": role,
+                    "content": "Model-specific instructions."
+                }]
+            }))
+            .unwrap();
+
+            let error = spec_messages_to_upstream(&request.messages).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("chat message role `{role}` is not supported by the router gRPC frontend")
+            );
+        }
     }
 
     #[test]
@@ -645,6 +691,45 @@ mod tests {
         assert_eq!(
             rust_ids, py_ids,
             "vllm-chat+vllm-tokenizer must match Python vllm on system+user"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_non_text_parts() {
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/wav;base64,AAAA"}
+            }),
+            serde_json::json!({"type": "text", "text": "hello"}),
+        ]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("multimodal chat is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_user_content_text_concatenates_text_parts() {
+        let plain = UserMessageContent::Text("plain".to_string());
+        assert_eq!(user_content_text(&plain).unwrap(), "plain");
+
+        let parts = UserMessageContent::Parts(vec![
+            serde_json::json!({"type": "text", "text": "foo"}),
+            serde_json::json!({"type": "text", "text": "bar"}),
+        ]);
+        assert_eq!(user_content_text(&parts).unwrap(), "foobar");
+    }
+
+    #[test]
+    fn test_user_content_text_rejects_malformed_text_part() {
+        // `type == "text"` but no string `text` field.
+        let parts = UserMessageContent::Parts(vec![serde_json::json!({"type": "text"})]);
+        let err = user_content_text(&parts).unwrap_err();
+        assert!(
+            err.to_string().contains("missing a string `text` field"),
+            "unexpected error: {err}"
         );
     }
 }
