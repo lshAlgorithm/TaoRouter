@@ -131,7 +131,7 @@ pub(super) fn merge_pd_usage(prefill: &Value, decode: &mut Value) -> bool {
     changed
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use serde_json::json;

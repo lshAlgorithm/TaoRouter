@@ -3676,7 +3676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalizer_reconciles_responses_api_and_preserves_unparseable_success() {
+    async fn finalizer_reconciles_responses_api_and_preserves_unparsable_success() {
         let prefill = json!({"usage": {"prompt_tokens_details": {"cached_tokens": 5}}});
         let response_body = r#"{"usage":{"input_tokens_details":{"cached_tokens":90}}}"#;
         let (decode, server) = mock_decode_response(StatusCode::OK, response_body).await;
