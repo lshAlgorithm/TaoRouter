@@ -43,14 +43,14 @@ _HARDWARE_CARDS_MARKER_TAG = "[hardware-cards]"
 _HARDWARE_PLATFORM_MARKER_TAG = "[hardware-platform]"
 _GPU_DEVICE_CLASS_TAG = "[gpu]"
 _CARDS_MARK_NAME_RE = re.compile(r"^cards_(\d+)$")
-# Indirect fixture in ``py_test.conftest``. Mixed-count ``@hardware_test``
+# Indirect fixture in ``tests/python/conftest.py``. Mixed-count ``@hardware_test``
 # parametrizes it so each collected item carries one platform's SKU and
 # ``cards_{n}``.
 HARDWARE_MARK_NORMALIZATION_FIXTURE = "_normalized_hardware_marks"
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 @lru_cache(maxsize=1)

@@ -25,7 +25,7 @@ from pathlib import Path
 from types import ModuleType
 
 HARDWARE_HELPERS = ("hardware_test", "hardware_marks")
-_ALLOWED_DIRECT_MARK_FILES = frozenset({"py_test/helpers/mark.py"})
+_ALLOWED_DIRECT_MARK_FILES = frozenset({"tests/python/helpers/mark.py"})
 _DIRECT_PLATFORM_ALLOWLIST = frozenset({"cpu"})
 
 HELPER_RE = re.compile(r"(?:" + "|".join(HARDWARE_HELPERS) + r")\s*\(")
@@ -72,7 +72,7 @@ def _relative(path: str) -> str:
 
 @lru_cache(maxsize=1)
 def _mark_module() -> ModuleType:
-    path = _repo_root() / "py_test" / "helpers" / "mark.py"
+    path = _repo_root() / "tests" / "python" / "helpers" / "mark.py"
     spec = importlib.util.spec_from_file_location("_router_mark", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load mark helpers from {path}")

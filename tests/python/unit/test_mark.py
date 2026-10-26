@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import py_test.helpers.mark as hw
-from py_test.helpers.mark import (
+from ..helpers import mark as hw
+from ..helpers.mark import (
     HARDWARE_MARK_NORMALIZATION_FIXTURE,
     get_hardware_mark_list,
     get_level_markers,

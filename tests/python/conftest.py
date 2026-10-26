@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from py_test.helpers.mark import HARDWARE_MARK_NORMALIZATION_FIXTURE
+from .helpers.mark import HARDWARE_MARK_NORMALIZATION_FIXTURE
 
 # Ensure local sources in py_src are importable ahead of any installed package
 _ROOT = Path(__file__).resolve().parents[2]
