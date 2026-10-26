@@ -420,7 +420,7 @@ async fn successful_profiling_stops_each_worker_once() {
 }
 
 #[tokio::test]
-async fn successful_headers_keep_each_modes_original_rules() {
+async fn successful_headers_keep_upstream_filtering_rules() {
     for (discovery, concurrent, stream, logprobs) in [
         (false, false, false, false),
         (false, false, true, false),
@@ -449,19 +449,13 @@ async fn successful_headers_keep_each_modes_original_rules() {
             .await;
         assert_eq!(response.status(), 200);
         let headers = response.headers();
-        let direct_sequential = !discovery && !concurrent;
-        let filtered_stream = !direct_sequential && stream;
-        assert_eq!(
-            headers.contains_key("transfer-encoding"),
-            !direct_sequential && !stream
-        );
+        assert!(!headers.contains_key("transfer-encoding"));
         assert!(!headers.contains_key("content-length"));
-        if filtered_stream {
+        assert!(!headers.contains_key("connection"));
+        if logprobs && !stream {
             assert!(!headers.contains_key("content-encoding"));
-            assert!(!headers.contains_key("connection"));
         } else {
             assert_eq!(headers["content-encoding"], "identity");
-            assert_eq!(headers["connection"], "close");
         }
         assert_eq!(headers["x-backend"], "preserved");
         assert_eq!(headers.get_all("set-cookie").iter().count(), 2);

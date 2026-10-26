@@ -187,31 +187,11 @@ async fn successful_logprobs_still_merge() {
             if concurrent {
                 f.warmup().await;
             }
-            let bytes = if !discovery && !concurrent {
-                // Preserve the original direct sequential HTTP regression case.
-                let response = f
-                    .request("/v1/chat/completions", "success-logprobs", true)
-                    .await;
-                assert_eq!(response.status(), 200);
-                response.bytes().await.unwrap()
-            } else {
-                // Isolate merging from the shared paths' existing Content-Length
-                // behavior by reading the router body before HTTP framing.
-                let response = f
-                    .router
-                    .route_transparent(
-                        None,
-                        "/v1/chat/completions",
-                        &http::Method::POST,
-                        json!({"model":"success-logprobs", "messages":[], "logprobs":true, "max_tokens":16}),
-                    )
-                    .await;
-                assert_eq!(response.status(), 200);
-                axum::body::to_bytes(response.into_body(), 4096)
-                    .await
-                    .unwrap()
-            };
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let response = f
+                .request("/v1/chat/completions", "success-logprobs", true)
+                .await;
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
             assert_eq!(
                 body["prompt_logprobs"],
                 json!([null, {"1":{"logprob":-0.5}}])
