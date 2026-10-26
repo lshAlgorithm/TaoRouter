@@ -37,7 +37,7 @@ repos:
     hooks:
       - id: black
         language_version: python3.12
-        files: ^(py_src|py_test)/.*\.py$
+        files: ^(py_src|tests/python)/.*\.py$
 
   # Ruff lint. Rev matches the former Buildkite pin ruff==0.16.0.
   # The old hook id `ruff` was removed from ruff-pre-commit; `ruff-check`
@@ -47,7 +47,7 @@ repos:
     hooks:
       - id: ruff-check
         args: ['--fix', '--exit-non-zero-on-fix']
-        files: ^(py_src|py_test)/.*\.py$
+        files: ^(py_src|tests/python)/.*\.py$
 
   # Python type checking. Same hook as before; CI skips it while
   # `pre-commit run mypy --all-files` is still dirty.
@@ -91,3 +91,11 @@ repos:
         language: python
         files: ^\.buildkite/.*\.ya?ml$
         additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
+
+      # Cargo only auto-discovers tests/*.rs. Nested tests/rust/*.rs need [[test]].
+      - id: check-rust-tests
+        name: check rust [[test]] registration
+        language: python
+        entry: python tools/pre_commit/check_rust_tests.py
+        files: ^(Cargo\.toml|tests/rust/[^/]+\.rs)$
+        pass_filenames: false

@@ -15,5 +15,5 @@ thw = "thw"
 [files]
 extend-exclude = [
     "scripts/deepseek/*-oom-logs.txt",
-    "tests/fixtures/tokenizer/byte_level_bpe.json",
+    "tests/rust/fixtures/tokenizer/byte_level_bpe.json",
 ]
