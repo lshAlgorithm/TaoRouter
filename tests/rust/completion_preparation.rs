@@ -19,7 +19,7 @@ fn tokenizer() -> HuggingFaceTokenizer {
     validate_completion_tokenizer_definition(&definition).unwrap();
     HuggingFaceTokenizer::new_hf(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tokenizer/completion_word_level.json"),
+            .join("tests/rust/fixtures/tokenizer/completion_word_level.json"),
     )
     .unwrap()
 }
@@ -375,7 +375,7 @@ fn classified_service_failure_is_not_invalid_or_unsupported() {
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 1);
     let failing = HuggingFaceTokenizer::new_hf(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tokenizer/completion_missing_unk.json"),
+            .join("tests/rust/fixtures/tokenizer/completion_missing_unk.json"),
     )
     .unwrap();
     let request = request(json!({"prompt": "unknown token"}));
