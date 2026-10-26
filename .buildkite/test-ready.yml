@@ -2,7 +2,7 @@
 # Uploaded when a non-default branch has the ready label (Omni READY_LABEL_IF).
 # CPU unit and integration tests, a non-publishing image build, and one
 # NVIDIA P/D completion. Full GSM8K is test-nightly.yml.
-# py_test/e2e stays ignored here; regular-router, embeddings, and
+# tests/python/e2e stays ignored here; regular-router, embeddings, and
 # test_pd_router.py are not wired to a GPU lane in this split.
 
 env:
@@ -76,7 +76,7 @@ steps:
                 - -c
                 - |
                   source .buildkite/scripts/install_packages.sh python
-                  pytest py_test/ -v --ignore=py_test/e2e --cov=vllm_router --cov-report=xml --cov-report=term
+                  pytest tests/python/ -v --ignore=tests/python/e2e --cov=vllm_router --cov-report=xml --cov-report=term
         artifact_paths:
           - "coverage.xml"
         agents:
@@ -112,7 +112,7 @@ steps:
       # vLLM, NIXL, lm-eval, and vllm-router are on PATH in the CI image.
 
       # L1 smoke: /health, /v1/models, and one completion. Not full GSM8K.
-      cd py_test/e2e/pd_disagg_vllm
+      cd tests/python/e2e/pd_disagg_vllm
       export SKIP_LM_EVAL=true
       export NUM_SANITY_REQUESTS=1
       bash ./run_accuracy_test.sh
