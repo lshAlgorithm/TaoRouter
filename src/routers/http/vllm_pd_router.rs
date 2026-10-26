@@ -808,7 +808,10 @@ impl VllmPDRouter {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
             let status = decode_response.status();
-            let resp_headers = decode_response.headers().clone();
+            let mut resp_headers =
+                header_utils::preserve_response_headers(decode_response.headers());
+            resp_headers.remove(axum::http::header::CONTENT_LENGTH);
+            resp_headers.remove(axum::http::header::CONTENT_ENCODING);
             let decode_body = decode_response
                 .bytes()
                 .await
@@ -863,7 +866,7 @@ impl VllmPDRouter {
         }
 
         // Non-streaming, no logprobs: read entire body
-        let decode_headers = decode_response.headers().clone();
+        let decode_headers = header_utils::preserve_response_headers(decode_response.headers());
         let body = decode_response
             .bytes()
             .await
@@ -1670,7 +1673,7 @@ impl VllmPDRouter {
         self.stop_profiling(&decode_base_url).await;
 
         let status = decode_response.status();
-        let headers = decode_response.headers().clone();
+        let headers = header_utils::preserve_response_headers(decode_response.headers());
 
         info!("📥 Decode response status: {}", status);
         info!("📥 Decode response headers: {:?}", headers);
@@ -1736,7 +1739,10 @@ impl VllmPDRouter {
 
             let mut response_builder = Response::builder().status(status);
             for (key, value) in headers.iter() {
-                if key != "transfer-encoding" && key != "content-length" {
+                if key != "transfer-encoding"
+                    && key != "content-length"
+                    && key != "content-encoding"
+                {
                     response_builder = response_builder.header(key, value);
                 }
             }
@@ -2890,6 +2896,88 @@ mod tests {
         url
     }
 
+    #[tokio::test]
+    async fn test_decode_response_filters_headers_in_every_branch() {
+        let router = test_vllm_pd_router();
+        for (streaming, logprobs) in [(false, false), (false, true), (true, false)] {
+            // A real reqwest response, with a backend content length that will
+            // become invalid when prompt logprobs are merged into the JSON.
+            let decode: reqwest::Response = axum::http::Response::builder()
+                .header("connection", "X-Internal")
+                .header("x-internal", "private")
+                .header("trailer", "x-checksum")
+                .header("content-length", "2")
+                .header("content-type", "application/json")
+                .header("set-cookie", "a=1")
+                .header("set-cookie", "b=2")
+                .body("{}")
+                .unwrap()
+                .into();
+            let prefill = json!({"prompt_logprobs": [1, 2, 3]});
+            let response = router
+                .handle_decode_response(
+                    decode,
+                    Some(&prefill),
+                    "/v1/chat/completions",
+                    "prefill",
+                    "decode",
+                    "decode",
+                    Instant::now(),
+                    streaming,
+                    logprobs,
+                )
+                .await
+                .unwrap();
+            for name in ["connection", "x-internal", "trailer"] {
+                assert!(
+                    !response.headers().contains_key(name),
+                    "{name} leaked (streaming={streaming}, logprobs={logprobs})"
+                );
+            }
+            assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+            if streaming || logprobs {
+                assert!(!response.headers().contains_key("content-length"));
+            }
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if logprobs {
+                let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(decoded["prompt_logprobs"], prefill["prompt_logprobs"]);
+            } else {
+                assert_eq!(bytes.as_ref(), b"{}");
+            }
+        }
+        for streaming in [false, true] {
+            // Encoded bytes are relayed unchanged; removing their encoding
+            // would make the client interpret compressed data as plaintext.
+            let encoded = vec![0x1f, 0x8b, 0x08, 0x00, 0xff];
+            let decode: reqwest::Response = axum::http::Response::builder()
+                .header("content-encoding", "gzip")
+                .body(encoded.clone())
+                .unwrap()
+                .into();
+            let response = router
+                .handle_decode_response(
+                    decode,
+                    None,
+                    "/v1/chat/completions",
+                    "prefill",
+                    "decode",
+                    "decode",
+                    Instant::now(),
+                    streaming,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), encoded.as_slice());
+        }
+    }
     use serde_json::json;
 
     #[test]
