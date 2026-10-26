@@ -140,6 +140,7 @@ impl Router {
                     kv_penalty_host: self.kv_penalty_host,
                     kv_penalty_external: self.kv_penalty_external,
                     kv_penalty_disk: self.kv_penalty_disk,
+                    smetric: None,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value
@@ -589,3 +590,9 @@ fn vllm_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Router>()?;
     Ok(())
 }
+
+#[cfg(test)]
+use crate as router_library;
+#[cfg(test)]
+#[path = "../tests/rust/common/mock_vllm_rs.rs"]
+mod test_mock_vllm_rs;

@@ -7,7 +7,11 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rand::Rng;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
+use super::smetric::SMetricStrategy;
+use super::{
+    get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders, RequestTracker, RoutingContext,
+};
+use crate::config::SMetricConfig;
 use crate::core::Worker;
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 
@@ -25,6 +29,12 @@ pub trait KvAwareOps: Send + Sync {
         matches: Option<Arc<dyn TieredMatchProvider>>,
     );
     fn unregister_worker(&self, worker_url: &str);
+    fn allows_worker_discovery(&self, worker_url: &str) -> bool;
+    fn select_request_with_receipt(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        context: &RoutingContext<'_>,
+    ) -> Option<(KvSelectionReceipt, Option<RequestTracker>)>;
     fn select_worker_with_receipt(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -493,6 +503,7 @@ impl TieredMatchProvider for EmptyMatchProvider {
 
 #[derive(Clone)]
 struct TargetBinding {
+    worker_id: Option<usize>,
     target: RoutableTarget,
     cache_key: Option<CacheKey>,
     matches: Arc<dyn TieredMatchProvider>,
@@ -502,6 +513,7 @@ struct TargetBinding {
 /// Registered `kv_aware` policy. Discovery binds each worker target to the
 /// placement provider for its cache identity.
 pub struct KvAwarePolicy {
+    smetric: Option<SMetricStrategy>,
     matches: Arc<dyn TieredMatchProvider>,
     load: Arc<dyn LoadProvider>,
     slot_manager: Option<Arc<dyn SlotManager>>,
@@ -533,7 +545,14 @@ impl KvAwarePolicy {
             picker: Arc::new(TemperaturePicker::new(params.router_temperature)),
             params,
             targets: DashMap::new(),
+            smetric: None,
         }
+    }
+
+    pub fn with_smetric(mut self, config: SMetricConfig) -> Self {
+        self.smetric = Some(SMetricStrategy::new(config));
+        self.slot_manager = None;
+        self
     }
 
     pub fn with_components(
@@ -551,6 +570,7 @@ impl KvAwarePolicy {
             picker,
             params,
             targets: DashMap::new(),
+            smetric: None,
         }
     }
 
@@ -558,6 +578,7 @@ impl KvAwarePolicy {
         self.targets.insert(
             worker_url.into(),
             TargetBinding {
+                worker_id: None,
                 target,
                 cache_key: None,
                 matches: self.matches.clone(),
@@ -577,6 +598,7 @@ impl KvAwarePolicy {
         self.targets.insert(
             worker_url.into(),
             TargetBinding {
+                worker_id: None,
                 target,
                 cache_key: Some(cache_key),
                 matches,
@@ -610,14 +632,25 @@ impl KvAwarePolicy {
     fn binding_for_worker(&self, worker: &dyn Worker) -> TargetBinding {
         self.targets
             .get(worker.url())
+            .filter(|entry| {
+                self.smetric.is_none()
+                    || entry
+                        .worker_id
+                        .is_none_or(|id| id == worker as *const dyn Worker as *const () as usize)
+            })
             .map(|entry| entry.clone())
             .unwrap_or_else(|| TargetBinding {
+                worker_id: None,
                 target: RoutableTarget {
                     instance_id: Arc::from(worker.base_url()),
                     dp_rank: worker.dp_rank().unwrap_or(0) as u32,
                 },
                 cache_key: None,
-                matches: self.matches.clone(),
+                matches: if self.smetric.is_some() {
+                    Arc::new(EmptyMatchProvider)
+                } else {
+                    self.matches.clone()
+                },
                 block_size: self.params.block_size,
             })
     }
@@ -659,6 +692,32 @@ impl KvAwarePolicy {
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
     ) -> Option<KvSelectionReceipt> {
+        self.select_with_context(workers, token_ids, lora_name, cache_salt, None)
+            .map(|(receipt, _)| receipt)
+    }
+
+    pub fn select_request_with_receipt(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        context: &RoutingContext<'_>,
+    ) -> Option<(KvSelectionReceipt, Option<RequestTracker>)> {
+        self.select_with_context(
+            workers,
+            context.kv.as_ref().map(|kv| kv.token_ids),
+            context.kv.as_ref().and_then(|kv| kv.lora_name),
+            context.kv.as_ref().and_then(|kv| kv.cache_salt),
+            Some(context),
+        )
+    }
+
+    fn select_with_context(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        token_ids: Option<&[u32]>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        context: Option<&RoutingContext<'_>>,
+    ) -> Option<(KvSelectionReceipt, Option<RequestTracker>)> {
         let healthy = get_healthy_worker_indices(workers);
         if healthy.is_empty() {
             return None;
@@ -679,21 +738,22 @@ impl KvAwarePolicy {
             if matches_by_identity.contains_key(&identity) {
                 continue;
             }
-            let local_hashes = if placement_enabled {
-                token_ids
-                    .map(|ids| Self::local_hashes_with_lora(ids, binding.block_size, lora_name))
-                    .unwrap_or_default()
+            let query_tokens = token_ids.filter(|_| placement_enabled);
+            let query = if self.smetric.is_some() {
+                SMetricStrategy::match_query(query_tokens, binding.block_size, lora_name)
             } else {
-                Vec::new()
-            };
-            let matches = if local_hashes.is_empty() {
-                Vec::new()
-            } else {
-                binding.matches.find_tiered_matches(&MatchQuery {
+                MatchQuery {
                     group_idx: 0,
-                    local_hashes,
+                    local_hashes: query_tokens
+                        .map(|ids| Self::local_hashes_with_lora(ids, binding.block_size, lora_name))
+                        .unwrap_or_default(),
                     tiers_of_interest: Self::tiers_of_interest(),
-                })
+                }
+            };
+            let matches = if query.local_hashes.is_empty() {
+                Vec::new()
+            } else {
+                binding.matches.find_tiered_matches(&query)
             };
             matches_by_identity.insert(identity, matches);
         }
@@ -729,6 +789,16 @@ impl KvAwarePolicy {
                 }
             })
             .collect();
+
+        if let Some(strategy) = &self.smetric {
+            return strategy.select_candidates(
+                workers,
+                &healthy,
+                &candidates,
+                bindings.iter().map(|binding| binding.block_size),
+                context,
+            );
+        }
 
         let mut costs = vec![0.0; candidates.len()];
         let mut components = vec![CostComponents::default(); candidates.len()];
@@ -789,15 +859,18 @@ impl KvAwarePolicy {
         let target = bindings.get(picked)?.target.clone();
         let mut selected_params = base_params;
         selected_params.block_size = bindings[picked].block_size;
-        Some(KvSelectionReceipt {
-            worker_index,
-            new_prefill_tokens: request_prefill_tokens(&candidates[picked], &selected_params),
-            decision: CostDecision {
-                target,
-                cost: costs[picked],
-                components: components[picked],
+        Some((
+            KvSelectionReceipt {
+                worker_index,
+                new_prefill_tokens: request_prefill_tokens(&candidates[picked], &selected_params),
+                decision: CostDecision {
+                    target,
+                    cost: costs[picked],
+                    components: components[picked],
+                },
             },
-        })
+            None,
+        ))
     }
 
     pub fn decision_for(
@@ -817,6 +890,39 @@ impl Default for KvAwarePolicy {
 }
 
 impl LoadBalancingPolicy for KvAwarePolicy {
+    fn on_worker_removed(&self, worker: &Arc<dyn Worker>) {
+        if let Some(strategy) = &self.smetric {
+            strategy.on_worker_removed(worker);
+        }
+        let id = Arc::as_ptr(worker) as *const () as usize;
+        if let Some((_, binding)) = self.targets.remove_if(worker.url(), |_, binding| {
+            binding.worker_id.is_none_or(|bound| bound == id)
+        }) {
+            if let Some(manager) = &self.slot_manager {
+                manager.unregister_target(&binding.target);
+            }
+        }
+    }
+
+    fn select_request(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        context: &RoutingContext<'_>,
+    ) -> Option<(usize, Option<RequestTracker>)> {
+        if self.smetric.is_some() {
+            self.select_request_with_receipt(workers, context)
+                .map(|(receipt, tracker)| (receipt.worker_index, tracker))
+        } else {
+            self.select_worker_with_headers(workers, text, headers)
+                .map(|idx| (idx, None))
+        }
+    }
+
+    fn needs_affinity_prompt(&self) -> bool {
+        self.smetric.is_some()
+    }
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -842,16 +948,62 @@ impl KvAwareOps for KvAwarePolicy {
         info: &WorkerKvInfo,
         matches: Option<Arc<dyn TieredMatchProvider>>,
     ) {
+        let id = worker as *const dyn Worker as *const () as usize;
+        if let Some(strategy) = &self.smetric {
+            strategy.with_active_worker(worker, || {
+                if let (Some((target, key)), Some(provider)) =
+                    (SMetricStrategy::binding_target(worker, info), matches)
+                {
+                    self.targets.insert(
+                        worker.url().to_string(),
+                        TargetBinding {
+                            worker_id: Some(id),
+                            target,
+                            block_size: key.block_size,
+                            cache_key: Some(key),
+                            matches: provider,
+                        },
+                    );
+                    return;
+                }
+                self.targets
+                    .remove_if(worker.url(), |_, binding| binding.worker_id == Some(id));
+            });
+            return;
+        }
         let target = RoutableTarget {
             instance_id: Arc::from(info.instance_id.as_str()),
             dp_rank: worker.dp_rank().unwrap_or(0) as u32,
         };
-        match (info.cache_key.clone(), matches) {
-            (Some(cache_key), Some(matches)) => {
-                self.register_target_with_cache_identity(worker.url(), target, cache_key, matches);
+        let (cache_key, provider, block_size) = match (info.cache_key.clone(), matches) {
+            (Some(key), Some(provider)) => {
+                let size = key.block_size;
+                (Some(key), provider, size)
             }
-            _ => self.register_target(worker.url(), target),
-        }
+            _ => (None, self.matches.clone(), self.params.block_size),
+        };
+        self.targets.insert(
+            worker.url().to_string(),
+            TargetBinding {
+                worker_id: Some(id),
+                target,
+                block_size,
+                cache_key,
+                matches: provider,
+            },
+        );
+    }
+
+    fn allows_worker_discovery(&self, worker_url: &str) -> bool {
+        self.smetric.is_none() || crate::backend::is_grpc_url(worker_url)
+    }
+
+    fn select_request_with_receipt(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        context: &RoutingContext<'_>,
+    ) -> Option<(KvSelectionReceipt, Option<RequestTracker>)> {
+        KvAwarePolicy::select_request_with_receipt(self, workers, context)
     }
 
     fn unregister_worker(&self, worker_url: &str) {
@@ -878,6 +1030,10 @@ impl KvAwareOps for KvAwarePolicy {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "kv_aware/smetric_tests.rs"]
+mod smetric_tests;
 
 #[cfg(test)]
 mod tests {
