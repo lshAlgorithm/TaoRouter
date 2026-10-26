@@ -117,6 +117,21 @@ impl PodInfo {
         }
     }
 
+    /// Check if a pod event should be allowed through the watcher stream firewall.
+    /// Returns true if the pod matches the selector or is currently in the tracked set.
+    pub fn should_allow_event(
+        pod: &Pod,
+        config: &ServiceDiscoveryConfig,
+        tracked_pods: &HashMap<String, TrackedPod>,
+    ) -> bool {
+        let pod_key = format!(
+            "{}/{}",
+            pod.metadata.namespace.as_deref().unwrap_or(""),
+            pod.metadata.name.as_deref().unwrap_or("")
+        );
+        Self::should_include(pod, config) || tracked_pods.contains_key(&pod_key)
+    }
+
     /// Unified PodInfo creation with optional PD configuration
     pub fn from_pod(pod: &Pod, config: Option<&ServiceDiscoveryConfig>) -> Option<Self> {
         let name = pod.metadata.name.clone()?;
@@ -293,16 +308,11 @@ pub async fn start_service_discovery(
                 async move {
                     match obj_res {
                         Ok(pod) => {
-                            let pod_key = format!(
-                                "{}/{}",
-                                pod.metadata.namespace.as_deref().unwrap_or(""),
-                                pod.metadata.name.as_deref().unwrap_or("")
-                            );
-                            let is_tracked = tracked_pods_inner
-                                .lock()
-                                .map_or(false, |map| map.contains_key(&pod_key));
+                            let is_allowed = tracked_pods_inner.lock().is_ok_and(|tracked| {
+                                PodInfo::should_allow_event(&pod, &config_inner, &tracked)
+                            });
 
-                            if PodInfo::should_include(&pod, &config_inner) || is_tracked {
+                            if is_allowed {
                                 Some(Ok(pod))
                             } else {
                                 None
@@ -405,18 +415,16 @@ async fn handle_pod_event(
                 }
             };
 
-            if tracker.contains_key(&pod_info.pod_key()) {
-                false // Already tracked
-            } else {
+            if let std::collections::hash_map::Entry::Vacant(e) = tracker.entry(pod_info.pod_key())
+            {
                 // Reserve the spot; store the registered URL and pod type for exact removal later.
-                tracker.insert(
-                    pod_info.pod_key(),
-                    TrackedPod {
-                        worker_url: worker_url.clone(),
-                        pod_type: pod_info.pod_type.clone(),
-                    },
-                );
+                e.insert(TrackedPod {
+                    worker_url: worker_url.clone(),
+                    pod_type: pod_info.pod_type.clone(),
+                });
                 true
+            } else {
+                false // Already tracked
             }
         };
 
@@ -1471,10 +1479,10 @@ mod tests {
             .contains_key(&daemon_pod.pod_key()));
     }
 
-    #[tokio::test]
-    async fn test_filter_firewall_logic() {
-        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
-        tracked_pods.lock().unwrap().insert(
+    #[test]
+    fn test_filter_firewall_logic() {
+        let mut tracked_pods = HashMap::new();
+        tracked_pods.insert(
             "/tracked-vllm-pod".to_string(),
             TrackedPod {
                 worker_url: "http://1.0.0.1:8000".to_string(),
@@ -1482,21 +1490,56 @@ mod tests {
             },
         );
 
-        // The firewall key is "namespace/name"; tests use empty namespace = "/name"
-        let check_firewall = |pod_name: &str, should_include: bool| -> bool {
-            let key = format!("/{}", pod_name);
-            let is_tracked = tracked_pods.lock().unwrap().contains_key(&key);
-            should_include || is_tracked
-        };
+        let mut config = ServiceDiscoveryConfig::default();
+        config
+            .selector
+            .insert("app".to_string(), "vllm".to_string());
 
         // Case 1: Unrelated cluster pod (no match, not tracked) -> DROPPED
-        assert!(!check_firewall("unrelated-monitoring-pod", false));
+        let unrelated_pod = create_k8s_pod(
+            Some("unrelated-monitoring-pod"),
+            Some("10.0.0.9"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        assert!(!PodInfo::should_allow_event(
+            &unrelated_pod,
+            &config,
+            &tracked_pods
+        ));
 
         // Case 2: New worker pod (matches selector, not yet tracked) -> PASSED
-        assert!(check_firewall("new-vllm-pod", true));
+        let mut new_worker_pod = create_k8s_pod(
+            Some("new-vllm-pod"),
+            Some("10.0.0.10"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("app".to_string(), "vllm".to_string());
+        new_worker_pod.metadata.labels = Some(labels);
+        assert!(PodInfo::should_allow_event(
+            &new_worker_pod,
+            &config,
+            &tracked_pods
+        ));
 
         // Case 3: Tracked pod whose label changed (mismatched selector, but tracked) -> PASSED for cleanup!
-        assert!(check_firewall("tracked-vllm-pod", false)); // key = /tracked-vllm-pod
+        let tracked_pod_mutated = create_k8s_pod(
+            Some("tracked-vllm-pod"),
+            Some("1.0.0.1"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        // Labels empty or canary -> mismatched selector, but pod is tracked
+        assert!(PodInfo::should_allow_event(
+            &tracked_pod_mutated,
+            &config,
+            &tracked_pods
+        ));
     }
 
     #[tokio::test]
