@@ -111,6 +111,10 @@ impl EngineFrontend {
         self.tokenizer.pin_test_token_ids(token_ids);
     }
 
+    pub(crate) async fn completion_frontend(&self, model: &str) -> anyhow::Result<FrontendHandle> {
+        self.tokenizer.resolve(Some(model)).await
+    }
+
     /// Tokenizer handle + sampling defaults shared by both prepare paths;
     /// returns the request start instant and the resolve-stage milliseconds.
     async fn resolve_with_defaults(
