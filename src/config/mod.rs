@@ -81,6 +81,26 @@ pub fn parse_static_kv_event_sources(
     Ok(sources)
 }
 
+/// Parse repeatable static PD KV-source specifications for both launchers.
+pub fn parse_pd_kv_events(
+    specs: &[String],
+) -> ConfigResult<std::collections::HashMap<String, PdKvEventSources>> {
+    let mut sources = std::collections::HashMap::new();
+    for spec in specs {
+        let (url, endpoints) = parse_event_source_spec(spec, "pd-kv-events")?;
+        sources.insert(
+            url.to_owned(),
+            PdKvEventSources {
+                endpoints,
+                replay_endpoints: None,
+                block_size: 16,
+                model: None,
+            },
+        );
+    }
+    Ok(sources)
+}
+
 fn parse_event_source_spec<'a>(spec: &'a str, flag: &str) -> ConfigResult<(&'a str, Vec<String>)> {
     let (worker, endpoints) =
         spec.split_once('=')
