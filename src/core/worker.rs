@@ -155,12 +155,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     // TODO: - Enhanced Worker Discovery
     // The Worker trait should handle async discovery of metadata from the worker itself
-    // rather than having service discovery or other components query /get_server_info.
+    // rather than having service discovery or other components query backend-specific APIs.
     // This keeps service discovery decoupled from worker-specific APIs.
     //
     // Proposed additions:
     // - async fn discover_metadata(&mut self) -> Result<(), Error>
-    //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
+    //   Discover backend metadata and populate model_id, priority, cost, etc.
     // - async fn validate_configuration(&self) -> Result<(), Error>
     //   Ensure worker has required configuration for its mode
     // - Make worker creation async to allow metadata discovery during initialization
@@ -287,6 +287,7 @@ pub struct WorkerMetadata {
 #[derive(Clone)]
 pub struct BasicWorker {
     metadata: WorkerMetadata,
+    dp_size: Option<usize>,
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
@@ -299,6 +300,7 @@ impl fmt::Debug for BasicWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
+            .field("dp_size", &self.dp_size)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
             .finish()
@@ -326,6 +328,7 @@ impl BasicWorker {
 
         Self {
             metadata,
+            dp_size: None,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -337,6 +340,12 @@ impl BasicWorker {
 
     pub fn with_labels(mut self, labels: std::collections::HashMap<String, String>) -> Self {
         self.metadata.labels = labels;
+        self
+    }
+
+    /// Attach a known DP group size when this worker represents a single-rank endpoint.
+    pub fn with_dp_size(mut self, dp_size: usize) -> Self {
+        self.dp_size = Some(dp_size.max(1));
         self
     }
 
@@ -462,7 +471,7 @@ impl Worker for BasicWorker {
 
     fn decrement_load(&self) {
         self.load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
             .ok();
@@ -486,6 +495,10 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    fn dp_size(&self) -> Option<usize> {
+        self.dp_size
     }
 }
 
