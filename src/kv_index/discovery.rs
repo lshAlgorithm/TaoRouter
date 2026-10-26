@@ -94,6 +94,8 @@ struct WorkerDiscovery {
 struct WorkerSubs {
     key: CacheKey,
     source_id: SourceId,
+    worker_origin: Option<String>,
+    replay_endpoints: Vec<String>,
     ranks: Vec<u32>,
     indexer: Arc<KvBlockIndexer>,
     handles: Vec<SubscriberHandle>,
@@ -161,8 +163,13 @@ impl KvIndexSupervisor {
     ) -> Result<(Self, mpsc::Receiver<IngestionSignal>), String> {
         let (mut supervisor, signals) = Self::new(client, hash_mode);
         supervisor.dense_http = true;
-        if let Ok(value) = std::env::var("VLLM_ROUTER_KV_EVENT_SOURCES") {
-            supervisor.static_sources = parse_static_sources(&value, worker_urls)?;
+        if worker_urls
+            .iter()
+            .any(|url| !crate::backend::is_grpc_url(url))
+        {
+            if let Ok(value) = std::env::var("VLLM_ROUTER_KV_EVENT_SOURCES") {
+                supervisor.static_sources = parse_static_sources(&value, worker_urls)?;
+            }
         }
         Ok((supervisor, signals))
     }
@@ -266,12 +273,9 @@ impl KvIndexSupervisor {
             hash_mode: self.hash_mode,
             block_size,
         };
-        let indexer = self.acquire_identity(&key);
-
         let worker_host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_string());
         let source_id: SourceId = Arc::from(instance_id.as_str());
-        let mut ranks = Vec::with_capacity(sources.len());
-        let mut handles = Vec::with_capacity(sources.len());
+        let mut event_sources = Vec::with_capacity(sources.len());
 
         for (rank_str, entry) in &sources {
             if !events_enabled(entry) {
@@ -314,7 +318,49 @@ impl KvIndexSupervisor {
                 topic: entry.topic.clone(),
                 hwm: entry.hwm,
             };
-            let handle = if self.dense_http {
+            event_sources.push(ev);
+        }
+
+        // Dense HTTP bindings require plain origins. Generic discovery retains
+        // its backend-specific URI scope, including HTTP base paths.
+        let worker_origin = if self.dense_http && !crate::backend::is_grpc_url(worker_url) {
+            Some(super::endpoints::canonical_worker(worker_url)?.0)
+        } else {
+            None
+        };
+        // Admission and publication share the existing source-owner lock. Two
+        // concurrent discoveries must not both accept an ambiguous binding.
+        let mut workers = self.workers.lock();
+        if workers.contains_key(worker_url) {
+            return Err("KV worker was registered while discovery was pending".into());
+        }
+        if worker_origin.as_ref().is_some_and(|origin| {
+            workers
+                .values()
+                .any(|worker| worker.worker_origin.as_ref() == Some(origin))
+        }) {
+            return Err("KV worker origins must be independent".into());
+        }
+        let mut replay_endpoints = Vec::new();
+        for source in &event_sources {
+            if let Some(endpoint) = &source.replay_endpoint {
+                // This replay protocol sends only start_seq, not a source key.
+                if replay_endpoints.contains(endpoint)
+                    || workers
+                        .values()
+                        .any(|worker| worker.replay_endpoints.contains(endpoint))
+                {
+                    return Err("KV replay endpoints must be independent".into());
+                }
+                replay_endpoints.push(endpoint.clone());
+            }
+        }
+        let indexer = self.acquire_identity(&key);
+        let mut ranks = Vec::with_capacity(event_sources.len());
+        let mut handles = Vec::with_capacity(event_sources.len());
+        for ev in event_sources {
+            let rank = ev.dp_rank;
+            let handle = if self.dense_http && !crate::backend::is_grpc_url(worker_url) {
                 crate::kv_index::subscriber::spawn_dense(
                     ev,
                     indexer.clone(),
@@ -338,11 +384,13 @@ impl KvIndexSupervisor {
             ranks.push(rank);
         }
 
-        self.workers.lock().insert(
+        workers.insert(
             worker_url.to_string(),
             WorkerSubs {
                 key: key.clone(),
                 source_id,
+                worker_origin,
+                replay_endpoints,
                 ranks: ranks.clone(),
                 indexer,
                 handles,
@@ -455,6 +503,8 @@ fn parse_static_sources(
     let mut sources: HashMap<String, StaticKvEventSources> =
         serde_json::from_str(value).map_err(|error| format!("static KV sources: {error}"))?;
     let mut endpoints = std::collections::HashSet::new();
+    let mut replay_endpoints = std::collections::HashSet::new();
+    let mut worker_origins = std::collections::HashSet::new();
     for (worker, source) in &mut sources {
         if !worker_urls.contains(worker)
             || source.endpoints.len() != 1
@@ -468,6 +518,9 @@ fn parse_static_sources(
         {
             return Err(format!("invalid static DP1 KV source for {worker}"));
         }
+        if !worker_origins.insert(super::endpoints::canonical_worker(worker)?.0) {
+            return Err("static KV worker origins must be independent".into());
+        }
         source.endpoints[0] =
             crate::kv_index::parse_endpoint_mapping(&format!("{worker}={}", source.endpoints[0]))?
                 .1;
@@ -477,6 +530,9 @@ fn parse_static_sources(
         if let Some(replay) = &mut source.replay_endpoints {
             replay[0] =
                 crate::kv_index::parse_endpoint_mapping(&format!("{worker}={}", replay[0]))?.1;
+            if !replay_endpoints.insert(replay[0].clone()) {
+                return Err("static KV replay endpoints must be independent".into());
+            }
         }
     }
     Ok(sources)
@@ -972,6 +1028,424 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert!(sources.contains_key(&workers[0]));
         assert!(!sources.contains_key(&workers[1]));
+    }
+
+    #[test]
+    fn static_sources_reject_shared_replay_endpoints() {
+        use serde_json::json;
+
+        let workers: [String; 2] = ["http://worker:8000".into(), "http://worker:8001".into()];
+        let value = json!({
+            &workers[0]: {"endpoints": ["tcp://worker:5557"],
+                "replay_endpoints": ["tcp://WORKER:5558"], "block_size": 16, "model": "served-alias"},
+            &workers[1]: {"endpoints": ["tcp://worker:5559"],
+                "replay_endpoints": ["tcp://worker:5558"], "block_size": 16, "model": "served-alias"}
+        });
+        assert!(parse_static_sources(&value.to_string(), &workers)
+            .unwrap_err()
+            .contains("replay endpoints must be independent"));
+    }
+
+    #[test]
+    fn static_sources_reject_worker_origin_aliases_and_keep_original_keys() {
+        use serde_json::json;
+
+        let source = |publisher: u16, replay: Option<&str>| {
+            let mut value = json!({
+                "endpoints": [format!("tcp://worker:{publisher}")],
+                "block_size": 16, "model": "served-alias"
+            });
+            if let Some(replay) = replay {
+                value["replay_endpoints"] = json!([replay]);
+            }
+            value
+        };
+        for (first, second) in [
+            ("http://worker:8000", "http://worker:8000/"),
+            ("http://WORKER:80", "http://worker/"),
+            ("https://WORKER:443", "https://worker"),
+        ] {
+            let workers = [first.to_owned(), second.to_owned()];
+            let value = json!({first: source(5557, None), second: source(5559, None)});
+            assert!(parse_static_sources(&value.to_string(), &workers)
+                .unwrap_err()
+                .contains("worker origins must be independent"));
+        }
+        for (first, second) in [
+            ("http://WORKER:80/", "https://worker:443"),
+            ("http://worker:8000/", "http://worker:8001"),
+            ("http://127.0.0.1:8000", "http://[::ffff:127.0.0.1]:8000"),
+        ] {
+            let workers = [first.to_owned(), second.to_owned()];
+            let value =
+                json!({first: source(5557, None), second: source(5559, Some("tcp://worker:5560"))});
+            let parsed = parse_static_sources(&value.to_string(), &workers).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert!(parsed.contains_key(first));
+            assert!(parsed.contains_key(second));
+        }
+    }
+
+    async fn source_boundary_worker(
+        publisher: &str,
+        replay: &str,
+        instance: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+
+        let info =
+            json!({"model_id": "boundary-model", "instance_id": instance, "kv_block_size": 8});
+        let sources = json!({"0": {
+            "endpoint": publisher, "replay_endpoint": replay, "topic": "kv/boundary",
+            "publisher": "zmq", "encoding": "msgpack", "schema_version": 1,
+            "enable_kv_cache_events": true
+        }});
+        let app = Router::new()
+            .route(
+                "/get_server_info",
+                get(move || {
+                    let info = info.clone();
+                    async move { Json(info) }
+                }),
+            )
+            .route(
+                "/kv_event_sources",
+                get(move || {
+                    let sources = sources.clone();
+                    async move { Json(sources) }
+                }),
+            );
+        let app = app.clone().nest("/proxy", app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (worker, task)
+    }
+
+    async fn boundary_subscription(publisher: &zmq::Socket) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match publisher.recv_bytes(zmq::DONTWAIT) {
+                    Ok(frame) => {
+                        assert_eq!(frame, b"\x01kv/boundary");
+                        break;
+                    }
+                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                    Err(error) => panic!("boundary subscription: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovered_sources_reject_shared_replay_before_wrong_owner_is_published() {
+        use crate::kv_index::{MatchQuery, StorageTier};
+        use serde_json::json;
+
+        let context = zmq::Context::new();
+        let a = context.socket(zmq::XPUB).unwrap();
+        let b = context.socket(zmq::XPUB).unwrap();
+        let replay = context.socket(zmq::ROUTER).unwrap();
+        for socket in [&a, &b, &replay] {
+            socket.bind("tcp://127.0.0.1:*").unwrap();
+        }
+        let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
+        let (worker_a, http_a) = source_boundary_worker(
+            &a.get_last_endpoint().unwrap().unwrap(),
+            &replay_endpoint,
+            "boundary-a",
+        )
+        .await;
+        let (worker_b, http_b) = source_boundary_worker(
+            &b.get_last_endpoint().unwrap().unwrap(),
+            &replay_endpoint,
+            "boundary-b",
+        )
+        .await;
+        let (supervisor, mut signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        supervisor.on_worker_added(&worker_a).await.unwrap();
+        boundary_subscription(&a).await;
+        let payload = |hash: u32, token: u32| {
+            rmp_serde::to_vec(&(
+                1.0,
+                [json!({
+                    "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
+                    "token_ids": vec![token; 8], "block_size": 8, "medium": "GPU",
+                    "lora_id": null, "lora_name": null
+                })],
+                0u32,
+            ))
+            .unwrap()
+        };
+        a.send_multipart(
+            [
+                b"kv/boundary".as_slice(),
+                &0i64.to_be_bytes(),
+                &payload(1, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(5), signals.recv()).await.unwrap(),
+            Some(IngestionSignal::Advance { source, last_seq: 0 }) if source.as_ref() == "boundary-a")
+        );
+        let query = |token| MatchQuery {
+            group_idx: 0,
+            local_hashes: crate::kv_index::local_block_hash_strings(&[token; 8], 8, None),
+            tiers_of_interest: vec![StorageTier::Device],
+        };
+        let admission = supervisor.on_worker_added(&worker_b).await;
+        if let Err(error) = admission {
+            let rejected = supervisor.match_provider_for_worker(&worker_b).is_none();
+            let retained = supervisor
+                .match_provider_for_worker(&worker_a)
+                .unwrap()
+                .find_tiered_matches(&query(1));
+            supervisor.shutdown();
+            http_a.abort();
+            http_b.abort();
+            assert!(
+                error.contains("replay endpoints must be independent"),
+                "{error}"
+            );
+            assert!(rejected);
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].target.instance_id.as_ref(), "boundary-a");
+            assert_eq!(retained[0].segments, [(0, 1)]);
+            return;
+        }
+        // Keep the real protocol counterexample in the regression: seq/topic/rank
+        // do not prove that the replay peer's payload belongs to this Worker.
+        boundary_subscription(&b).await;
+        b.send_multipart(
+            [
+                b"kv/boundary".as_slice(),
+                &0i64.to_be_bytes(),
+                &payload(1, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(5), signals.recv()).await.unwrap(),
+            Some(IngestionSignal::Advance { source, last_seq: 0 }) if source.as_ref() == "boundary-b")
+        );
+        let foreign = payload(2, 2);
+        a.send_multipart(
+            [b"kv/boundary".as_slice(), &1i64.to_be_bytes(), &foreign],
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(5), signals.recv()).await.unwrap(),
+            Some(IngestionSignal::Advance { source, last_seq: 1 }) if source.as_ref() == "boundary-a")
+        );
+        let fresh = payload(3, 3);
+        b.send_multipart([b"kv/boundary".as_slice(), &2i64.to_be_bytes(), &fresh], 0)
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match replay.recv_multipart(zmq::DONTWAIT) {
+                    Ok(request) => break request,
+                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                    Err(error) => panic!("boundary replay request: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(request.last().unwrap(), &1i64.to_be_bytes());
+        for (seq, body) in [(1i64, foreign), (2, fresh), (-1, vec![])] {
+            replay
+                .send_multipart(
+                    [
+                        request[0].clone(),
+                        vec![],
+                        if seq == -1 {
+                            vec![]
+                        } else {
+                            b"kv/boundary".to_vec()
+                        },
+                        seq.to_be_bytes().to_vec(),
+                        body,
+                    ],
+                    0,
+                )
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(signals.recv().await, Some(IngestionSignal::Advance { source, last_seq: 2 }) if source.as_ref() == "boundary-b") {}
+        }).await.unwrap();
+        let hits = supervisor
+            .match_provider_for_worker(&worker_b)
+            .unwrap()
+            .find_tiered_matches(&query(2));
+        supervisor.shutdown();
+        http_a.abort();
+        http_b.abort();
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target.instance_id.as_ref() != "boundary-b"),
+            "replayed A-only payload acquired B ownership: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_source_bindings_are_atomic_and_released_with_the_worker() {
+        let context = zmq::Context::new();
+        let publisher_a = context.socket(zmq::XPUB).unwrap();
+        let publisher_b = context.socket(zmq::XPUB).unwrap();
+        let replay = context.socket(zmq::ROUTER).unwrap();
+        for socket in [&publisher_a, &publisher_b, &replay] {
+            socket.bind("tcp://127.0.0.1:*").unwrap();
+        }
+        let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
+        let (worker_a, http_a) = source_boundary_worker(
+            &publisher_a.get_last_endpoint().unwrap().unwrap(),
+            &replay_endpoint,
+            "binding-a",
+        )
+        .await;
+        let (worker_b, http_b) = source_boundary_worker(
+            &publisher_b.get_last_endpoint().unwrap().unwrap(),
+            &replay_endpoint,
+            "binding-b",
+        )
+        .await;
+        let worker_a = format!("{worker_a}/");
+        let (supervisor, _signals) = KvIndexSupervisor::new_http_dense(
+            reqwest::Client::new(),
+            HashMode::Sha256,
+            &[worker_a.clone(), worker_b.clone()],
+        )
+        .unwrap();
+        let (a, b) = tokio::join!(
+            supervisor.on_worker_added(&worker_a),
+            supervisor.on_worker_added(&worker_b)
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        let (accepted, rejected) = if a.is_ok() {
+            (&worker_a, &worker_b)
+        } else {
+            (&worker_b, &worker_a)
+        };
+        assert_eq!(supervisor.workers.lock().len(), 1);
+        assert_eq!(
+            supervisor
+                .identity_refs
+                .lock()
+                .values()
+                .copied()
+                .sum::<usize>(),
+            1
+        );
+        assert!(supervisor.match_provider_for_worker(accepted).is_some());
+        assert!(supervisor.match_provider_for_worker(rejected).is_none());
+        supervisor.on_worker_removed(accepted);
+        assert!(supervisor.workers.lock().is_empty());
+        assert!(supervisor.identity_refs.lock().is_empty());
+        supervisor.on_worker_added(rejected).await.unwrap();
+        let alias = if rejected.ends_with('/') {
+            rejected.trim_end_matches('/').to_owned()
+        } else {
+            format!("{rejected}/")
+        };
+        let error = supervisor.on_worker_added(&alias).await.unwrap_err();
+        assert!(error.contains("worker origins must be independent"));
+        assert!(supervisor.workers.lock().contains_key(rejected));
+        assert!(!supervisor.workers.lock().contains_key(&alias));
+        assert_eq!(
+            supervisor
+                .identity_refs
+                .lock()
+                .values()
+                .copied()
+                .sum::<usize>(),
+            1
+        );
+        supervisor.on_worker_removed(rejected);
+        let (first, second) = tokio::join!(
+            supervisor.on_worker_added(rejected),
+            supervisor.on_worker_added(rejected)
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        assert_eq!(supervisor.workers.lock().len(), 1);
+        assert_eq!(
+            supervisor
+                .identity_refs
+                .lock()
+                .values()
+                .copied()
+                .sum::<usize>(),
+            1
+        );
+        supervisor.shutdown();
+        assert!(supervisor.workers.lock().is_empty());
+        assert!(supervisor.identity_refs.lock().is_empty());
+        http_a.abort();
+        http_b.abort();
+    }
+
+    #[tokio::test]
+    async fn generic_http_discovery_preserves_worker_base_paths() {
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        let replay = context.socket(zmq::ROUTER).unwrap();
+        for socket in [&publisher, &replay] {
+            socket.bind("tcp://127.0.0.1:*").unwrap();
+        }
+        let (worker, http_task) = source_boundary_worker(
+            &publisher.get_last_endpoint().unwrap().unwrap(),
+            &replay.get_last_endpoint().unwrap().unwrap(),
+            "prefixed-source",
+        )
+        .await;
+        let prefixed = format!("{worker}/proxy");
+        let (generic, _) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let result = generic.on_worker_added(&prefixed).await;
+        let registered = generic.match_provider_for_worker(&prefixed).is_some();
+        let original_absent = generic.match_provider_for_worker(&worker).is_none();
+        generic.shutdown();
+        let (dense, _) = KvIndexSupervisor::new_http_dense(
+            reqwest::Client::new(),
+            HashMode::Sha256,
+            std::slice::from_ref(&prefixed),
+        )
+        .unwrap();
+        let dense_result = dense.on_worker_added(&prefixed).await;
+        let unqualified = dense.match_provider_for_worker(&prefixed).is_none();
+        dense.shutdown();
+        http_task.abort();
+        let info = result.unwrap();
+        assert_eq!(info.instance_id, "prefixed-source");
+        assert_eq!(info.ranks, [0]);
+        assert!(registered);
+        assert!(original_absent);
+        assert!(dense_result.unwrap_err().contains("plain HTTP(S) origins"));
+        assert!(unqualified);
+    }
+
+    #[test]
+    fn empty_and_grpc_pools_ignore_http_static_configuration() {
+        for workers in [vec![], vec!["grpc://worker:50051".to_owned()]] {
+            let (supervisor, _) = KvIndexSupervisor::new_http_dense(
+                reqwest::Client::new(),
+                HashMode::Sha256,
+                &workers,
+            )
+            .unwrap();
+            assert!(supervisor.dense_http);
+            assert!(supervisor.static_sources.is_empty());
+            supervisor.shutdown();
+        }
+        let (generic, _) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        assert!(!generic.dense_http);
+        generic.shutdown();
     }
 
     #[tokio::test]
