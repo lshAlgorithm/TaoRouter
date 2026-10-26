@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Fail if a pytest or Rust test file is missing the marks CI uses to select it.
 
-Python (``py_test/**/test_*.py``, not ``py_test/e2e``): every pytest module
+Python (``tests/python/**/test_*.py``, not ``tests/python/e2e``): every pytest module
 needs a ``[ci-level]`` mark (``ready``) and a machine mark. A module counts
 when it imports pytest or defines ``test_*`` / ``Test*`` items. Comments and
 strings do not count as marks. ``pytest.mark.cpu`` is written directly. SKUs
 and other platforms must come from ``hardware_test`` or ``hardware_marks`` so
 ``cards_{n}`` is attached.
 
-Rust (``tests/*.rs`` integration crates, and ``src/**/*.rs`` that contain a
+Rust (``tests/rust/*.rs`` and ``tests/*.rs`` integration crates, and ``src/**/*.rs`` that contain a
 test module): the file must name one Cargo feature tagged ``[ci-level]`` and
 one tagged ``[hardware-platform]`` (currently ``ready`` and ``cpu``).
 """
@@ -29,13 +29,15 @@ _ALLOWED_DIRECT_MARK_FILES = frozenset({"py_test/helpers/mark.py"})
 _DIRECT_PLATFORM_ALLOWLIST = frozenset({"cpu"})
 
 HELPER_RE = re.compile(r"(?:" + "|".join(HARDWARE_HELPERS) + r")\s*\(")
-PY_TEST_FILE_RE = re.compile(r"^py_test/(?:.*/)?(?:test_[^/]*\.py$|[^/]*_test\.py$)")
+PY_TEST_FILE_RE = re.compile(
+    r"^tests/python/(?:.*/)?(?:test_[^/]*\.py$|[^/]*_test\.py$)"
+)
 # Pytest collects module-level test_* functions and Test* classes without
 # importing pytest. Indented test_* methods on other classes are not items.
 _TEST_ITEM_RE = re.compile(
     r"(?m)^(?:async[ \t]+def[ \t]+test_\w+|def[ \t]+test_\w+|class[ \t]+Test\w+\b)"
 )
-RUST_INTEGRATION_RE = re.compile(r"^tests/[^/]+\.rs$")
+RUST_INTEGRATION_RE = re.compile(r"^tests/(?:rust/)?[^/]+\.rs$")
 RUST_TEST_CFG_RE = re.compile(r"#\[\s*(?:cfg\(\s*test\b|cfg\(\s*all\(\s*test\b|test\b)")
 
 MISSING_LEVEL = "Level"
@@ -206,7 +208,7 @@ def _is_pytest_module(scanned: str) -> bool:
 
 
 def _python_problems(rel: str, contents: str) -> list[str]:
-    if not PY_TEST_FILE_RE.match(rel) or rel.startswith("py_test/e2e/"):
+    if not PY_TEST_FILE_RE.match(rel) or rel.startswith("tests/python/e2e/"):
         return []
     scanned = _source_without_comments_and_strings(contents)
     if not _is_pytest_module(scanned):
@@ -228,7 +230,7 @@ def _python_problems(rel: str, contents: str) -> list[str]:
 
 
 def _is_rust_test(rel: str, contents: str) -> bool:
-    if rel.startswith("tests/common/") or rel.startswith("tests/fixtures/"):
+    if rel.startswith(("tests/common/", "tests/fixtures/", "tests/rust/common/")):
         return False
     if RUST_INTEGRATION_RE.match(rel):
         return True

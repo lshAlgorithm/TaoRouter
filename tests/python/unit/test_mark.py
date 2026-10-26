@@ -1,5 +1,8 @@
 """Unit tests for the L4 / MI300 hardware mark helpers."""
 
+import inspect
+from pathlib import Path
+
 import pytest
 
 import py_test.helpers.mark as hw
@@ -150,4 +153,5 @@ def test_normalization_fixture_is_registered(request):
     assert defs
     registered = defs[-1]
     assert registered.argname == HARDWARE_MARK_NORMALIZATION_FIXTURE
-    assert registered.func.__module__ == "py_test.conftest"
+    source = Path(inspect.getfile(registered.func)).resolve()
+    assert source == Path(__file__).resolve().parents[1] / "conftest.py"
