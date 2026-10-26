@@ -67,6 +67,8 @@ struct TrackedPod {
     worker_url: String,
     /// The PD role at registration time.
     pod_type: Option<PodType>,
+    /// The Kubernetes pod UID at registration time.
+    uid: Option<String>,
 }
 
 /// Represents a Kubernetes pod's information used for worker management
@@ -76,6 +78,8 @@ pub struct PodInfo {
     /// Kubernetes namespace the pod belongs to. Empty string when metadata.namespace is absent.
     /// Combined with `name` to form a cluster-unique tracking key via `pod_key()`.
     pub namespace: String,
+    /// Kubernetes pod UID. Used to reconcile same-name replacement pods across restarts/missed deletions.
+    pub uid: Option<String>,
     pub ip: IpAddr,
     pub status: String,
     pub is_ready: bool,
@@ -183,10 +187,12 @@ impl PodInfo {
         };
 
         let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+        let uid = pod.metadata.uid.clone();
 
         Some(PodInfo {
             name,
             namespace,
+            uid,
             ip: pod_ip,
             status: pod_status,
             is_ready,
@@ -405,8 +411,8 @@ async fn handle_pod_event(
 
     // If pod is healthy and matches the selector, try to add it (with atomic check-and-insert)
     if pod_info.is_healthy() && should_include {
-        // Atomic check-and-insert to prevent race conditions
-        let should_add = {
+        // Atomic check-and-insert/reconcile to prevent race conditions
+        let (should_add, stale_registration) = {
             let mut tracker = match tracked_pods.lock() {
                 Ok(tracker) => tracker,
                 Err(e) => {
@@ -415,18 +421,43 @@ async fn handle_pod_event(
                 }
             };
 
-            if let std::collections::hash_map::Entry::Vacant(e) = tracker.entry(pod_info.pod_key())
-            {
-                // Reserve the spot; store the registered URL and pod type for exact removal later.
-                e.insert(TrackedPod {
-                    worker_url: worker_url.clone(),
-                    pod_type: pod_info.pod_type.clone(),
-                });
-                true
-            } else {
-                false // Already tracked
+            match tracker.entry(pod_info.pod_key()) {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
+                    let existing = occ.get();
+                    let is_same = existing.worker_url == worker_url
+                        && existing.pod_type == pod_info.pod_type
+                        && (pod_info.uid.is_none() || existing.uid == pod_info.uid);
+
+                    if is_same {
+                        (false, None) // Exact duplicate: safe no-op
+                    } else {
+                        // Stale registration: pod was replaced (new IP or UID) or PD role flipped!
+                        let old = occ.insert(TrackedPod {
+                            worker_url: worker_url.clone(),
+                            pod_type: pod_info.pod_type.clone(),
+                            uid: pod_info.uid.clone(),
+                        });
+                        (true, Some(old))
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vac) => {
+                    vac.insert(TrackedPod {
+                        worker_url: worker_url.clone(),
+                        pod_type: pod_info.pod_type.clone(),
+                        uid: pod_info.uid.clone(),
+                    });
+                    (true, None)
+                }
             }
         };
+
+        if let Some(stale) = stale_registration {
+            info!(
+                "Reconciling stale pod registration for {}: evicting old URL {} (role: {:?})",
+                pod_info.name, stale.worker_url, stale.pod_type
+            );
+            remove_worker_from_router(&stale.worker_url, stale.pod_type, &router, pd_mode).await;
+        }
 
         if should_add {
             info!(
@@ -520,41 +551,48 @@ async fn remove_tracked_pod(
             "Removing pod ({}): {} | type: {:?} | url: {}",
             reason, pod_info.name, registered.pod_type, url
         );
-
-        // Handle PD mode removal using the originally registered pod type
-        if pd_mode {
-            use crate::routers::http::vllm_pd_router::VllmPDRouter;
-
-            if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
-                // Support --vllm-pd-disaggregation mode with K8s service discovery
-                match registered.pod_type {
-                    Some(PodType::Prefill) => {
-                        if let Err(e) = vllm_pd_router.remove_prefill_server(url).await {
-                            error!("Failed to remove vllm prefill server {}: {}", url, e);
-                        }
-                    }
-                    Some(PodType::Decode) => {
-                        if let Err(e) = vllm_pd_router.remove_decode_server(url).await {
-                            error!("Failed to remove vllm decode server {}: {}", url, e);
-                        }
-                    }
-                    Some(PodType::Regular) | None => {
-                        router.remove_worker(url);
-                    }
-                }
-            } else {
-                // PD mode but not a VllmPDRouter, use generic removal
-                router.remove_worker(url);
-            }
-        } else {
-            // Regular mode removal
-            router.remove_worker(url);
-        }
+        remove_worker_from_router(url, registered.pod_type, &router, pd_mode).await;
     } else {
         debug!(
             "Pod {} event for untracked/already removed pod: {} (type: {:?})",
             reason, pod_info.name, pod_info.pod_type
         );
+    }
+}
+
+async fn remove_worker_from_router(
+    url: &str,
+    pod_type: Option<PodType>,
+    router: &Arc<dyn RouterTrait>,
+    pd_mode: bool,
+) {
+    if pd_mode {
+        use crate::routers::http::vllm_pd_router::VllmPDRouter;
+
+        if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
+            // Support --vllm-pd-disaggregation mode with K8s service discovery
+            match pod_type {
+                Some(PodType::Prefill) => {
+                    if let Err(e) = vllm_pd_router.remove_prefill_server(url).await {
+                        error!("Failed to remove vllm prefill server {}: {}", url, e);
+                    }
+                }
+                Some(PodType::Decode) => {
+                    if let Err(e) = vllm_pd_router.remove_decode_server(url).await {
+                        error!("Failed to remove vllm decode server {}: {}", url, e);
+                    }
+                }
+                Some(PodType::Regular) | None => {
+                    router.remove_worker(url);
+                }
+            }
+        } else {
+            // PD mode but not a VllmPDRouter, use generic removal
+            router.remove_worker(url);
+        }
+    } else {
+        // Regular mode removal
+        router.remove_worker(url);
     }
 }
 
@@ -576,6 +614,7 @@ mod tests {
         let mut pod = Pod {
             metadata: ObjectMeta {
                 name: name.map(String::from),
+                uid: Some("default-uid".to_string()),
                 deletion_timestamp,
                 ..Default::default()
             },
@@ -622,6 +661,7 @@ mod tests {
         Pod {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
+                uid: Some("pd-uid".to_string()),
                 labels: Some(labels),
                 annotations: Some(annotations),
                 ..Default::default()
@@ -692,6 +732,7 @@ mod tests {
             check_interval: Duration::from_secs(60),
             port: 8080,
             namespace: None,
+            uid: None,
             pd_mode: true,
             prefill_selector,
             decode_selector,
@@ -900,10 +941,12 @@ mod tests {
         let healthy_pod = PodInfo {
             name: "p1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.1.1.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         assert!(healthy_pod.is_healthy());
@@ -911,10 +954,12 @@ mod tests {
         let not_ready_pod = PodInfo {
             name: "p2".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.1.1.2".parse().unwrap(),
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         assert!(!not_ready_pod.is_healthy());
@@ -922,10 +967,12 @@ mod tests {
         let not_running_pod = PodInfo {
             name: "p3".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.1.1.3".parse().unwrap(),
             status: "Pending".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         assert!(!not_running_pod.is_healthy());
@@ -936,10 +983,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "p1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
@@ -950,10 +999,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "p1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "2803:6086:5cd3:6062:c68d:e7c7:480:10".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         assert_eq!(
@@ -967,30 +1018,36 @@ mod tests {
         let pod1 = PodInfo {
             name: "pod1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            uid: None,
             bootstrap_port: Some(8081),
         };
 
         let pod2 = PodInfo {
             name: "pod1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            uid: None,
             bootstrap_port: Some(8081),
         };
 
         let pod3 = PodInfo {
             name: "pod1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1005,10 +1062,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "pod1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Pending".into(),
             is_ready: false,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let port = 8080u16;
@@ -1039,10 +1098,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "pod1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         handle_pod_deletion(
@@ -1064,10 +1125,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            uid: None,
             bootstrap_port: Some(8081),
         };
         let port = 8080u16;
@@ -1098,10 +1161,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "decode-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.5".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
+            uid: None,
             bootstrap_port: None,
         };
         let port = 8080u16;
@@ -1130,10 +1195,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "test-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            uid: None,
             bootstrap_port: Some(8081),
         };
 
@@ -1147,6 +1214,7 @@ mod tests {
                 TrackedPod {
                     worker_url: pod_info.worker_url(port),
                     pod_type: pod_info.pod_type.clone(),
+                    uid: None,
                 },
             );
         }
@@ -1173,10 +1241,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "untracked-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
+            uid: None,
             bootstrap_port: None,
         };
         // Don't add pod to tracked set
@@ -1200,10 +1270,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "regular-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Regular),
+            uid: None,
             bootstrap_port: None,
         };
         let port = 8080u16;
@@ -1233,10 +1305,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            uid: None,
             bootstrap_port: Some(8081),
         };
         let port = 8080u16;
@@ -1266,10 +1340,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "decode-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "1.2.3.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1283,6 +1359,7 @@ mod tests {
                 TrackedPod {
                     worker_url: pod_info.worker_url(port),
                     pod_type: pod_info.pod_type.clone(),
+                    uid: None,
                 },
             );
         }
@@ -1310,10 +1387,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "target-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "10.0.0.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: false, // Probe failed: Ready=False
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let port = 8000u16;
@@ -1324,6 +1403,7 @@ mod tests {
             TrackedPod {
                 worker_url: pod_info.worker_url(port),
                 pod_type: pod_info.pod_type.clone(),
+                uid: None,
             },
         );
 
@@ -1354,10 +1434,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "target-pod".into(),
             namespace: "".into(),
+            uid: None,
             ip: "10.0.0.2".parse().unwrap(),
             status: "Running".into(),
             is_ready: true, // Healthy, but label changed (role=canary)
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let port = 8000u16;
@@ -1368,6 +1450,7 @@ mod tests {
             TrackedPod {
                 worker_url: pod_info.worker_url(port),
                 pod_type: pod_info.pod_type.clone(),
+                uid: None,
             },
         );
 
@@ -1398,10 +1481,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "untracked".into(),
             namespace: "".into(),
+            uid: None,
             ip: "10.0.0.3".parse().unwrap(),
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let port = 8000u16;
@@ -1430,10 +1515,12 @@ mod tests {
         let live_pod = PodInfo {
             name: "vllm-worker-0".into(),
             namespace: "".into(),
+            uid: None,
             ip: "10.0.0.50".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1443,6 +1530,7 @@ mod tests {
             TrackedPod {
                 worker_url: live_pod.worker_url(port),
                 pod_type: live_pod.pod_type.clone(),
+                uid: None,
             },
         );
 
@@ -1450,10 +1538,12 @@ mod tests {
         let daemon_pod = PodInfo {
             name: "node-exporter-abc".into(),
             namespace: "".into(),
+            uid: None,
             ip: "10.0.0.50".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1487,6 +1577,7 @@ mod tests {
             TrackedPod {
                 worker_url: "http://1.0.0.1:8000".to_string(),
                 pod_type: None,
+                uid: None,
             },
         );
 
@@ -1555,6 +1646,7 @@ mod tests {
             TrackedPod {
                 worker_url: "http://10.0.1.1:8000".to_string(),
                 pod_type: Some(PodType::Prefill),
+                uid: None,
             },
         );
 
@@ -1562,10 +1654,12 @@ mod tests {
         let pod_info_stripped = PodInfo {
             name: "prefill-1".into(),
             namespace: "".into(),
+            uid: None,
             ip: "10.0.1.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Regular), // Labels stripped!
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1596,10 +1690,12 @@ mod tests {
         let pod_a = PodInfo {
             name: "worker-0".into(),
             namespace: "ns-a".into(),
+            uid: None,
             ip: "10.0.1.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1611,6 +1707,7 @@ mod tests {
                 TrackedPod {
                     worker_url: pod_a.worker_url(port),
                     pod_type: pod_a.pod_type.clone(),
+                    uid: None,
                 },
             );
         }
@@ -1619,10 +1716,12 @@ mod tests {
         let pod_b = PodInfo {
             name: "worker-0".into(),
             namespace: "ns-b".into(),
+            uid: None,
             ip: "10.0.2.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1738,10 +1837,12 @@ mod tests {
         let make_pod = |status: &str, is_ready: bool| PodInfo {
             name: "pod".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.0.1".parse().unwrap(),
             status: status.into(),
             is_ready,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1843,10 +1944,12 @@ mod tests {
         let original_pod = PodInfo {
             name: "worker-dynamic-ip".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.1.50".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1858,6 +1961,7 @@ mod tests {
                 TrackedPod {
                     worker_url: original_pod.worker_url(port),
                     pod_type: original_pod.pod_type.clone(),
+                    uid: None,
                 },
             );
         }
@@ -1866,10 +1970,12 @@ mod tests {
         let mutated_pod = PodInfo {
             name: "worker-dynamic-ip".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.1.99".parse().unwrap(),
             status: "Running".into(),
             is_ready: false, // unready trigger
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1899,10 +2005,12 @@ mod tests {
         let pod = PodInfo {
             name: "idem-pod".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.5.5".parse().unwrap(),
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -1943,10 +2051,12 @@ mod tests {
         let healthy_pod = PodInfo {
             name: "flapping-pod".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.6.6".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let unready_pod = PodInfo {
@@ -1960,6 +2070,7 @@ mod tests {
             TrackedPod {
                 worker_url: healthy_pod.worker_url(port),
                 pod_type: None,
+                uid: None,
             },
         );
         assert!(tracked_pods.lock().unwrap().contains_key(&pod_key));
@@ -1982,6 +2093,7 @@ mod tests {
             TrackedPod {
                 worker_url: healthy_pod.worker_url(port),
                 pod_type: None,
+                uid: None,
             },
         );
         assert!(tracked_pods.lock().unwrap().contains_key(&pod_key));
@@ -2147,28 +2259,34 @@ mod tests {
         let p1 = PodInfo {
             name: "worker-1".into(),
             namespace: "prod".into(),
+            uid: None,
             ip: "10.0.1.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let p2 = PodInfo {
             name: "worker-2".into(),
             namespace: "prod".into(),
+            uid: None,
             ip: "10.0.1.2".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let p3 = PodInfo {
             name: "worker-3".into(),
             namespace: "prod".into(),
+            uid: None,
             ip: "10.0.1.3".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -2181,6 +2299,7 @@ mod tests {
                     TrackedPod {
                         worker_url: p.worker_url(port),
                         pod_type: None,
+                        uid: None,
                     },
                 );
             }
@@ -2240,10 +2359,12 @@ mod tests {
         let pod = PodInfo {
             name: "failing-pod".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.2.15".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -2253,6 +2374,7 @@ mod tests {
             TrackedPod {
                 worker_url: pod.worker_url(port),
                 pod_type: None,
+                uid: None,
             },
         );
         assert!(tracked_pods.lock().unwrap().contains_key(&pod.pod_key()));
@@ -2288,10 +2410,12 @@ mod tests {
         let ipv6_pod = PodInfo {
             name: "ipv6-worker".into(),
             namespace: "prod".into(),
+            uid: None,
             ip: "2001:db8::100".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
         let expected_url = "http://[2001:db8::100]:8000";
@@ -2303,6 +2427,7 @@ mod tests {
             TrackedPod {
                 worker_url: ipv6_pod.worker_url(port),
                 pod_type: None,
+                uid: None,
             },
         );
         assert!(tracked_pods
@@ -2340,10 +2465,12 @@ mod tests {
         let pod = PodInfo {
             name: "stable-worker".into(),
             namespace: "prod".into(),
+            uid: None,
             ip: "10.0.4.4".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -2354,6 +2481,7 @@ mod tests {
             TrackedPod {
                 worker_url: original_url.clone(),
                 pod_type: None,
+                uid: None,
             },
         );
 
@@ -2383,10 +2511,12 @@ mod tests {
         let pod = PodInfo {
             name: "test-pod".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.0.1".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -2446,10 +2576,12 @@ mod tests {
         let pod_info = PodInfo {
             name: "deleting-pod".into(),
             namespace: "default".into(),
+            uid: None,
             ip: "10.0.3.50".parse().unwrap(),
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            uid: None,
             bootstrap_port: None,
         };
 
@@ -2459,6 +2591,7 @@ mod tests {
             TrackedPod {
                 worker_url: pod_info.worker_url(port),
                 pod_type: None,
+                uid: None,
             },
         );
         assert!(tracked_pods
@@ -2529,5 +2662,130 @@ mod tests {
             info.worker_url(8080),
             "http://[2001:db8:85a3::8a2e:370:7334]:8080"
         );
+    }
+
+    #[tokio::test]
+    async fn test_statefulset_pod_replacement_reconciles_new_ip_and_uid() {
+        // End-to-end regression test for reviewer [P2] (Thread 10):
+        // Uses a mock HTTP listener on 127.0.0.1 so router.add_worker succeeds.
+        // Old worker URL is evicted from the router, new worker URL is registered,
+        // and tracked_pods is updated with the new URL and UID.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let pod_key = "default/vllm-0".to_string();
+        let old_url = "http://10.0.1.1:8000".to_string();
+
+        // 1. Pre-track old pod registration
+        tracked_pods.lock().unwrap().insert(
+            pod_key.clone(),
+            TrackedPod {
+                worker_url: old_url.clone(),
+                pod_type: None,
+                uid: Some("uid-111".to_string()),
+            },
+        );
+        router.remove_worker(&old_url); // ensure router state clean
+
+        // 2. Replacement pod arrives at 127.0.0.1:mock_port with new UID
+        let replacement_pod = PodInfo {
+            name: "vllm-0".into(),
+            namespace: "default".into(),
+            uid: Some("uid-222".to_string()),
+            ip: "127.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            uid: None,
+            bootstrap_port: None,
+        };
+
+        handle_pod_event(
+            &replacement_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            mock_port,
+            false,
+            true,
+        )
+        .await;
+
+        // 3. Verify tracked_pods was reconciled with replacement pod's URL and UID
+        let map = tracked_pods.lock().unwrap();
+        let expected_url = format!("http://127.0.0.1:{}", mock_port);
+        assert_eq!(
+            map.get(&pod_key).map(|t| t.worker_url.as_str()),
+            Some(expected_url.as_str())
+        );
+        assert_eq!(
+            map.get(&pod_key).and_then(|t| t.uid.as_deref()),
+            Some("uid-222")
+        );
+
+        // 4. Verify router added the new worker and removed the old worker
+        assert!(router.get_worker_urls().contains(&expected_url));
+        assert!(!router.get_worker_urls().contains(&old_url));
+    }
+
+    #[tokio::test]
+    async fn test_pd_role_flip_via_label_mutation_reconciles_role() {
+        // End-to-end regression test for collaborator wuhang2014 review (Thread 11):
+        // When a registered Prefill pod is relabeled to Decode, handle_pod_event must
+        // evict the stale Prefill registration rather than skipping as duplicate.
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let port = 8000u16;
+
+        let pod_key = "default/worker-0".to_string();
+        let worker_url = "http://10.0.1.5:8000".to_string();
+
+        // 1. Pod initially registered as Prefill
+        tracked_pods.lock().unwrap().insert(
+            pod_key.clone(),
+            TrackedPod {
+                worker_url: worker_url.clone(),
+                pod_type: Some(PodType::Prefill),
+                uid: Some("uid-pd-1".to_string()),
+            },
+        );
+
+        // 2. Label mutates to Decode
+        let relabeled_pod = PodInfo {
+            name: "worker-0".into(),
+            namespace: "default".into(),
+            uid: Some("uid-pd-1".to_string()),
+            ip: "10.0.1.5".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Decode),
+            uid: None,
+            bootstrap_port: None,
+        };
+
+        handle_pod_event(
+            &relabeled_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+            true, // pd_mode = true
+            true, // matches selector
+        )
+        .await;
+
+        // 3. Stale Prefill was evicted via remove_worker_from_router.
+        // Because create_test_router is not a VllmPDRouter, add fails and cleans up tracking.
+        assert!(!router.get_worker_urls().contains(&worker_url));
     }
 }
