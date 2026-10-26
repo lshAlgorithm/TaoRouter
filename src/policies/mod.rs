@@ -23,11 +23,13 @@ pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+pub(crate) use kv_aware::KvAffinityTable;
 pub use kv_aware::{
-    cost_components, kv_aware_ops, CandidateView, CostComponents, CostDecision, CostParams,
-    InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvSelectionReceipt,
-    LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer, SelectionError, SlotManager,
-    TemperaturePicker, TieredMatchProvider, TransferCredits,
+    cost_components, kv_aware_ops, AffinityKey, CandidateView, CostComponents, CostDecision,
+    CostParams, InMemorySlotManager, KvAwareOps, KvAwarePolicy, KvRequestSlot, KvRequestTokens,
+    KvSelectionReceipt, LoadProvider, LoadSample, MultiplicativeScorer, Picker, Scorer,
+    SelectionError, SlotManager, TemperaturePicker, TieredMatchProvider, TransferCredits,
+    WorkerTokenInputs,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
@@ -112,6 +114,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
+    /// Whether request text must use the content-preserving cache routing key.
+    fn needs_cache_routing_key(&self) -> bool {
+        false
+    }
+
     /// Check if this policy needs HTTP headers for routing decisions
     fn needs_headers(&self) -> bool {
         false // Default: most policies don't need headers
@@ -155,6 +162,7 @@ pub struct CacheAwareConfig {
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
+    /// Per-worker character budget in each model tree, enforced by periodic eviction.
     pub max_tree_size: usize,
 }
 
