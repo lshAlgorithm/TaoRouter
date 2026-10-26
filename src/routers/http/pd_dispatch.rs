@@ -5,8 +5,8 @@ use super::pd_request_error::{
 use crate::metrics::RouterMetrics;
 use std::future::Future;
 
-/// A failure known at headers. Resolve the body only after scheduling, load
-/// guards, and legacy metrics have reached their failure boundary.
+/// A failure known at headers. Callers preserve their original load and metric
+/// boundaries when deciding when to resolve the body.
 pub(super) enum PdDispatchError {
     Classified(PdRequestError),
     Http {

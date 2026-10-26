@@ -93,6 +93,31 @@ fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
 }
 
+/// Merge a successful Decode body without changing the caller's header or forwarding policy.
+async fn merge_decode_logprobs_to_bytes(
+    decode_response: reqwest::Response,
+    prefill_response_json: Option<&Value>,
+) -> Result<Vec<u8>, PdRequestError> {
+    debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
+    let decode_body = decode_response
+        .bytes()
+        .await
+        .map_err(|e| PdRequestError::from_reqwest(PdPhase::Decode, e))?;
+    let mut decode_json: Value = serde_json::from_slice(&decode_body)
+        .map_err(|_| PdRequestError::protocol(PdPhase::Decode))?;
+
+    let empty_json = Value::Null;
+    let prefill_json = prefill_response_json.unwrap_or(&empty_json);
+    if logprobs_merge::merge_logprobs_in_json(prefill_json, &mut decode_json) {
+        debug!("Successfully merged logprobs from prefill and decode responses");
+    } else {
+        warn!("No logprobs were merged (might be expected if logprobs not in response)");
+    }
+
+    serde_json::to_vec(&decode_json)
+        .map_err(|_| PdRequestError::Internal(InternalErrorReason::SerializeResponse))
+}
+
 /// Build a prefill reqwest::RequestBuilder with the standard headers and dp-rank header.
 fn build_prefill_request_builder(
     http_client: &reqwest::Client,
@@ -801,29 +826,10 @@ impl VllmPDRouter {
         }
 
         if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
-
             let status = decode_response.status();
             let resp_headers = decode_response.headers().clone();
-            let decode_body = decode_response
-                .bytes()
-                .await
-                .map_err(|e| PdRequestError::from_reqwest(PdPhase::Decode, e))?;
-
-            let mut decode_json: Value = serde_json::from_slice(&decode_body)
-                .map_err(|_| PdRequestError::protocol(PdPhase::Decode))?;
-
-            let empty_json = Value::Null;
-            let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
-            let merged = logprobs_merge::merge_logprobs_in_json(prefill_json_ref, &mut decode_json);
-            if merged {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
-            }
-
-            let merged_body = serde_json::to_vec(&decode_json)
-                .map_err(|_| PdRequestError::Internal(InternalErrorReason::SerializeResponse))?;
+            let merged_body =
+                merge_decode_logprobs_to_bytes(decode_response, prefill_response_json).await?;
 
             let mut response_builder = axum::http::Response::builder().status(status);
             for (name, value) in resp_headers.iter() {
@@ -914,22 +920,9 @@ impl VllmPDRouter {
         }
 
         let body = if needs_logprobs && !is_streaming {
-            debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
-            let bytes = decode_response
-                .bytes()
-                .await
-                .map_err(|e| PdRequestError::from_reqwest(PdPhase::Decode, e))?;
-            let mut decode_json: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| PdRequestError::protocol(PdPhase::Decode))?;
-            if logprobs_merge::merge_logprobs_in_json(prefill_response_json, &mut decode_json) {
-                debug!("Successfully merged logprobs from prefill and decode responses");
-            } else {
-                warn!("No logprobs were merged (might be expected if logprobs not in response)");
-            }
             Body::from(
-                serde_json::to_vec(&decode_json).map_err(|_| {
-                    PdRequestError::Internal(InternalErrorReason::SerializeResponse)
-                })?,
+                merge_decode_logprobs_to_bytes(decode_response, Some(prefill_response_json))
+                    .await?,
             )
         } else {
             debug!(
@@ -1302,10 +1295,12 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
+                let error = PdRequestError::from_reqwest(PdPhase::Decode, e).into();
+                request_metrics.record_failure(&error, prefill_http, decode_http);
+                RouterMetrics::record_pd_prefill_request(prefill_http);
                 self.stop_profiling(&format!("http://{}", decode_base_http))
                     .await;
-                RouterMetrics::record_pd_prefill_request(prefill_http);
-                return Err(PdRequestError::from_reqwest(PdPhase::Decode, e).into());
+                return Err(error);
             }
         };
 
@@ -1530,6 +1525,7 @@ impl VllmPDRouter {
             Ok(resp) => resp,
             Err(e) => {
                 let error = PdRequestError::from_reqwest(PdPhase::Prefill, e).into();
+                drop(prefill_load);
                 request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
                 self.stop_profiling(&prefill_base_url).await;
                 return Err(error);
@@ -1549,9 +1545,15 @@ impl VllmPDRouter {
             );
         }
         if !prefill_response.status().is_success() {
-            let error = PdDispatchError::http(PdPhase::Prefill, prefill_response);
-            request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
+            // Direct sequential HTTP errors record after body capture and
+            // profiling cleanup, unlike the body-read/JSON failures below.
+            drop(prefill_load);
+            let error = PdDispatchError::http(PdPhase::Prefill, prefill_response)
+                .resolve()
+                .await
+                .into();
             self.stop_profiling(&prefill_base_url).await;
+            request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
             return Err(error);
         }
         let prefill_result: Result<_, PdRequestError> = async {
@@ -1568,8 +1570,12 @@ impl VllmPDRouter {
         let (prefill_response_json, prefill_bytes) = match prefill_result {
             Ok(result) => result,
             Err(error) => {
+                let error = error.into();
+                // Preserve the legacy failure boundary before cleanup can await.
+                drop(prefill_load);
+                request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
                 self.stop_profiling(&prefill_base_url).await;
-                return Err(error.into());
+                return Err(error);
             }
         };
 
@@ -1580,6 +1586,7 @@ impl VllmPDRouter {
                 .get("kv_transfer_params")
                 .is_some_and(Value::is_object)
         {
+            drop(prefill_load);
             self.stop_profiling(&prefill_base_url).await;
             return Err(PdRequestError::protocol(PdPhase::Prefill).into());
         }
@@ -1689,9 +1696,12 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                self.stop_profiling(&decode_base_url).await;
+                let error = PdRequestError::from_reqwest(PdPhase::Decode, e).into();
+                drop(decode_load);
+                request_metrics.record_failure(&error, &prefill_base_url, &decode_base_url);
                 RouterMetrics::record_pd_prefill_request(&prefill_base_url);
-                return Err(PdRequestError::from_reqwest(PdPhase::Decode, e).into());
+                self.stop_profiling(&decode_base_url).await;
+                return Err(error);
             }
         };
 

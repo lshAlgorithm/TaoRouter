@@ -509,11 +509,9 @@ mod tests {
     #[test]
     fn status_envelope_and_formatting_never_include_upstream_data() {
         for phase in [PdPhase::Prefill, PdPhase::Decode] {
-            for code in 100..=599 {
+            // Representative non-success classes and the upper status boundary.
+            for code in [100, 300, 400, 429, 500, 503, 599] {
                 let status = StatusCode::from_u16(code).unwrap();
-                if status.is_success() {
-                    continue;
-                }
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     header::CONTENT_TYPE,

@@ -5,37 +5,6 @@ use serde_json::{json, Value};
 use std::{sync::atomic::Ordering, time::Duration};
 
 #[tokio::test]
-async fn prefill_503_keeps_status_and_retry_after() {
-    let f = Fixture::direct(Duration::from_secs(2)).await;
-    assert_error(
-        f.request("/v1/chat/completions", "p-503", false).await,
-        503,
-        "prefill",
-    )
-    .await;
-    assert_eq!(f.d_calls.load(Ordering::SeqCst), 0);
-}
-#[tokio::test]
-async fn prefill_422_uses_safe_body() {
-    let f = Fixture::direct(Duration::from_secs(2)).await;
-    assert_error(
-        f.request("/v1/chat/completions", "p-422", false).await,
-        422,
-        "prefill",
-    )
-    .await;
-}
-#[tokio::test]
-async fn decode_non_json_error_precedes_logprobs() {
-    let f = Fixture::direct(Duration::from_secs(2)).await;
-    assert_error(
-        f.request("/v1/chat/completions", "d-429", true).await,
-        429,
-        "decode",
-    )
-    .await;
-}
-#[tokio::test]
 async fn real_timeout_and_connection_refusal() {
     let f = Fixture::direct(Duration::from_millis(150)).await;
     assert_error(
@@ -75,6 +44,9 @@ async fn all_topologies_endpoints_and_statuses() {
                             if phase == "p" { "prefill" } else { "decode" },
                         )
                         .await;
+                        if phase == "p" && !concurrent {
+                            assert_eq!(f.d_calls.load(Ordering::SeqCst), 0);
+                        }
                         f.assert_no_load();
                     }
                 }
@@ -209,16 +181,44 @@ async fn concurrent_prefill_success_body_timeout_is_a_504() {
 
 #[tokio::test]
 async fn successful_logprobs_still_merge() {
-    let f = Fixture::direct(Duration::from_secs(2)).await;
-    let response = f
-        .request("/v1/chat/completions", "success-logprobs", true)
-        .await;
-    assert_eq!(response.status(), 200);
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(
-        body["prompt_logprobs"],
-        json!([null, {"1":{"logprob":-0.5}}])
-    );
+    for discovery in [false, true] {
+        for concurrent in [false, true] {
+            let f = Fixture::new(Duration::from_secs(2), discovery).await;
+            if concurrent {
+                f.warmup().await;
+            }
+            let bytes = if !discovery && !concurrent {
+                // Preserve the original direct sequential HTTP regression case.
+                let response = f
+                    .request("/v1/chat/completions", "success-logprobs", true)
+                    .await;
+                assert_eq!(response.status(), 200);
+                response.bytes().await.unwrap()
+            } else {
+                // Isolate merging from the shared paths' existing Content-Length
+                // behavior by reading the router body before HTTP framing.
+                let response = f
+                    .router
+                    .route_transparent(
+                        None,
+                        "/v1/chat/completions",
+                        &http::Method::POST,
+                        json!({"model":"success-logprobs", "messages":[], "logprobs":true, "max_tokens":16}),
+                    )
+                    .await;
+                assert_eq!(response.status(), 200);
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap()
+            };
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["prompt_logprobs"],
+                json!([null, {"1":{"logprob":-0.5}}])
+            );
+            f.assert_no_load();
+        }
+    }
 }
 
 #[tokio::test]
