@@ -772,6 +772,7 @@ impl VllmPDRouter {
         start_time: Instant,
         is_streaming: bool,
         needs_logprobs: bool,
+        validate_recomputed: bool,
     ) -> Result<Response, String> {
         debug!(
             "Decode server responded with status: {}",
@@ -791,6 +792,13 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
+        let validate_recomputed = validate_recomputed && decode_response.status().is_success();
+        if validate_recomputed {
+            if let Some(error) = super::recompute_guard::encoding_error(&decode_response) {
+                return Ok(error);
+            }
+        }
+
         if needs_logprobs && !is_streaming {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
@@ -806,6 +814,10 @@ impl VllmPDRouter {
 
             let mut decode_json: Value = serde_json::from_slice(&decode_body)
                 .map_err(|e| format!("Failed to parse decode response as JSON: {}", e))?;
+
+            if validate_recomputed && super::recompute_guard::is_recomputed(&decode_json) {
+                return Ok(super::recompute_guard::failure_response());
+            }
 
             let empty_json = Value::Null;
             let prefill_json_ref = prefill_response_json.unwrap_or(&empty_json);
@@ -843,7 +855,13 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let body = if validate_recomputed {
+                Body::from_stream(super::recompute_guard::guard_stream(
+                    decode_response.bytes_stream(),
+                ))
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -858,6 +876,9 @@ impl VllmPDRouter {
             .bytes()
             .await
             .map_err(|e| format!("Failed to read decode response: {}", e))?;
+        if validate_recomputed && super::recompute_guard::interrupted(&body) {
+            return Ok(super::recompute_guard::failure_response());
+        }
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in decode_headers.iter() {
             response_builder = response_builder.header(name, value);
@@ -1064,6 +1085,7 @@ impl VllmPDRouter {
         let mut decode_request_builder = self
             .http_client
             .post(format!("http://{}{}", decode_base_http, path))
+            .header("Accept-Encoding", "identity")
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
@@ -1219,6 +1241,7 @@ impl VllmPDRouter {
                     start_time,
                     is_streaming,
                     needs_logprobs,
+                    super::recompute_guard::enabled(path, &request_json),
                 )
                 .await;
         }
@@ -1260,6 +1283,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            super::recompute_guard::enabled(path, &request_json),
         )
         .await
     }
@@ -1617,6 +1641,7 @@ impl VllmPDRouter {
             .pd_router
             .client
             .post(&decode_url)
+            .header("Accept-Encoding", "identity")
             .header("Content-Type", "application/json")
             .header(
                 "Authorization",
@@ -1692,7 +1717,15 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let validate_recomputed =
+            status.is_success() && super::recompute_guard::enabled(path, &original_request);
         // If logprobs requested and non-streaming, merge prefill and decode logprobs
+        if validate_recomputed {
+            if let Some(error) = super::recompute_guard::encoding_error(&decode_response) {
+                return Ok(error);
+            }
+        }
+
         if needs_logprobs && !is_streaming {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
@@ -1713,6 +1746,10 @@ impl VllmPDRouter {
                 serde_json::from_slice(&decode_body).map_err(|e| PDRouterError::NetworkError {
                     message: format!("Failed to parse decode response as JSON: {}", e),
                 })?;
+
+            if validate_recomputed && super::recompute_guard::is_recomputed(&decode_json) {
+                return Ok(super::recompute_guard::failure_response());
+            }
 
             // Merge logprobs from prefill into decode response
             let merged =
@@ -1758,7 +1795,28 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let body = if validate_recomputed && is_streaming {
+                Body::from_stream(super::recompute_guard::guard_stream(
+                    decode_response.bytes_stream(),
+                ))
+            } else if validate_recomputed {
+                let bytes =
+                    decode_response
+                        .bytes()
+                        .await
+                        .map_err(|e| PDRouterError::NetworkError {
+                            message: format!(
+                                "Failed to read decode response from {}: {}",
+                                decode_url, e
+                            ),
+                        })?;
+                if super::recompute_guard::interrupted(&bytes) {
+                    return Ok(super::recompute_guard::failure_response());
+                }
+                Body::from(bytes)
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -1858,7 +1916,9 @@ impl VllmPDRouter {
                 },
             ),
             otel_http::send_client_request(
-                stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
+                stage_builder(&decode_url, decode_dp_rank)
+                    .header("Accept-Encoding", "identity")
+                    .json(&decode_request),
                 headers,
                 ClientRequestOptions {
                     method: "POST",
@@ -1975,6 +2035,7 @@ impl VllmPDRouter {
             start_time,
             is_streaming,
             needs_logprobs,
+            super::recompute_guard::enabled(path, &decode_request),
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
